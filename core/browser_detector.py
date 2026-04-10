@@ -1,3 +1,13 @@
+"""
+Browser Detection Module
+========================
+
+This module is responsible for intelligently scouring the host Operating System 
+(Windows, macOS, Linux) to find paths to installed, Chromium-compatible web browsers.
+It writes the discovered binary path to the local `.env` configuration file to ensure 
+Selenium can launch successfully without requiring the user to manually configure paths.
+"""
+
 import os
 import platform
 import subprocess
@@ -7,11 +17,17 @@ from dotenv import load_dotenv, set_key, find_dotenv
 
 def detect_browser_paths():
     """
-    Detects browser paths on the current system (macOS or Windows) and updates .env file.
-    Searches in this order: Brave, Chrome, Safari, Edge, Firefox.
+    Scans common installation directories and user profiles across macOS and Windows 
+    to locate known browser executables.
+    
+    Order of Preference: Brave -> Chrome -> Safari -> Edge -> Firefox
+    (Chromium-based browsers are preferred for best compatibility with Selenium).
+    
+    If direct path lookups fail, it attempts to use OS command line utilities 
+    (`where` on Windows, `which` on macOS/Linux).
     
     Returns:
-        str: The path to the detected browser or None if no browser is found.
+        str: The absolute path to the detected browser or None if no browser is found.
     """
     system = platform.system()
     browser_paths = {}

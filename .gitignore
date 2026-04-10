@@ -28,3 +28,9 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 code_reader.py
+
+# AI model cache (large downloaded files, ~80MB — users download on first run)
+models/
+
+# Local AI learning database (contains private application history)
+data/

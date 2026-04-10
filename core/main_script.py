@@ -1,3 +1,23 @@
+"""
+Core Selenium Automation Script
+===============================
+
+This module is the heart of the Dice Auto-Apply Bot's interaction with the web browser.
+It manages all Selenium WebDriver lifecycles, DOM querying, and automation routines.
+
+Key Capabilities:
+-----------------
+1. **get_web_driver**: Initializes customized headful or headless Chromium-based 
+   browsers with anti-bot circumvention flags and alternative fallbacks.
+2. **apply_to_job_url**: The primary job application orchestrator (the 'Wizard'). 
+   - Uses Shadow-DOM parsing to navigate complex, React-based Dice components.
+   - Detects the presence of Resume inputs and uses either PyAutoGUI OS-level
+     hooks or direct DOM injection to upload the mathematically selected resume.
+3. **fetch_jobs_with_requests**: Responsible for iterating through search result
+   pages and intelligently collecting valid Job IDs while dynamically backing off
+   if it encounters captchas or empty states.
+"""
+
 import os
 import json
 import pandas as pd
@@ -18,6 +38,7 @@ import datetime
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote
+from core.matcher import ResumeMatcher
 # Try both absolute and relative imports for compatibility
 try:
     from dice_auto_apply.core.browser_detector import get_browser_path
@@ -184,17 +205,90 @@ def get_web_driver(headless=False, retry_with_alternative=True):
 
 
 
-def apply_to_job_url(driver, job_url):
+def apply_to_job_url(driver, job_url, resume_profiles=None, job_title: str = "", semantic_matcher=None, learning_engine=None, pause_check=None):
     """
     Applies to a job without opening a new tab, preventing focus stealing.
     Instead navigates to job URL in the same tab and returns to original URL when done.
+    Returns: (applied: bool, profile_name: str, match_reason: str, skip_reason: str, job_description: str, profile_id: int)
     """
+    if resume_profiles is None:
+        resume_profiles = []
+        
     # Store current URL to return to later
     original_url = driver.current_url
     
     # Navigate to job URL in the same tab
     driver.get(job_url)
     
+    # Read the optional name-boost mode from config
+    # Modes: "exact" | "high" | "low" | "off"  (default: "high")
+    try:
+        from utils.config_manager import ConfigManager
+        _cfg = ConfigManager()
+        name_boost_mode = str(_cfg.get("profile_name_boost_mode", "off")).strip().lower()
+        if name_boost_mode not in ("exact", "high", "low", "off"):
+            name_boost_mode = "off"
+    except Exception:
+        name_boost_mode = "off"
+
+    # Extract job description for resume matching
+    selected_resume_path = None
+    selected_profile_name = "Default/None"
+    selected_profile_id = None
+    matched_reason = "No keywords matched or no profiles"
+    skip_reason = ""  # Tracks why the job was not applied to
+    job_desc_text = ""
+    if resume_profiles:
+        try:
+            time.sleep(1) # Let the page load
+            job_desc_element = driver.find_element(By.TAG_NAME, "body")
+            job_desc_text = job_desc_element.text
+            
+            from core.matcher import ResumeMatcher
+            matcher = ResumeMatcher(resume_profiles, semantic_matcher=semantic_matcher, learning_engine=learning_engine)
+            ranked_results = matcher.score_profiles(
+                job_desc_text,
+                job_title=job_title,
+                name_boost_mode=name_boost_mode
+            )
+            
+            if ranked_results:
+                best_match = ranked_results[0]
+                selected_resume_path = best_match['file_path']
+                selected_profile_name = best_match['name']
+                selected_profile_id = best_match.get('id')
+                
+                u_sc   = best_match['uni_score']
+                g_sc   = best_match['gen_score']
+                tot    = best_match['score']
+                boost  = best_match.get('name_boost', 0.0)
+                aff    = best_match.get('name_affinity', 0.0)
+                sem_sc = best_match.get('semantic_score', 0)
+                l_sc   = best_match.get('learning_boost', 0)
+                
+                aff_pct = int(aff * 100)
+                
+                # Retrieve and format the actual keyword matches for the log
+                matched_uni = list(best_match.get('matched_uni', set()))
+                matched_gen = list(best_match.get('matched_gen', set()))
+                all_matched = sorted(matched_uni + matched_gen)
+                
+                # Limit to first 12 keywords for readability in Excel columns
+                kw_summary = ", ".join(all_matched[:12])
+                if len(all_matched) > 12:
+                    kw_summary += "..."
+                
+                matched_reason = (f"Score: {tot} (Words: {len(all_matched)}) "
+                                  f"| Matching: [{kw_summary}] "
+                                  f"| AI: {sem_sc}% | Name: {aff_pct}%")
+                
+                if l_sc > 0:
+                    matched_reason += f" | Learned: +{l_sc}"
+                
+                print(f"Selected resume: {selected_profile_name} (Reason: {matched_reason})")
+        except Exception as e:
+            print(f"Could not extract description for resume matching: {e}")
+            
     # Dice pages can be slow/heavy; give a bit more time for the apply control to become interactable
     wait = WebDriverWait(driver, 20)
     applied = False
@@ -214,6 +308,10 @@ def apply_to_job_url(driver, job_url):
         apply_kind = None
 
         for _ in range(max_attempts):
+            if pause_check and pause_check():
+                driver.get(original_url)
+                return False, selected_profile_name, "Stopped by user", "Bot stopped", job_desc_text, selected_profile_id
+                
             apply_check = driver.execute_script("""
                 // 2026 Dice UI: button with data-testid="apply-button"
                 const applyBtn = document.querySelector('button[data-testid="apply-button"]');
@@ -296,11 +394,12 @@ def apply_to_job_url(driver, job_url):
 
         if not status:
             driver.get(original_url)
-            return False
+            return False, selected_profile_name, "Button not found", "Apply button not found or timed out", job_desc_text, selected_profile_id
 
         if status == "already_applied":
             print(f"Skipping this Job as it is already applied: {job_url}")
             applied = True
+            skip_reason = "Already applied previously"
 
         elif status == "can_apply":
             click_success = False
@@ -362,6 +461,13 @@ def apply_to_job_url(driver, job_url):
                 """)
 
             if click_success:
+                # Dice commonly spawns popup application tabs. We MUST physically shift out of the base job-board tab if this happens!
+                # Use a longer wait for slow websites — 4 seconds is safer than 2
+                time.sleep(4.0)
+                original_window = driver.current_window_handle
+                if len(driver.window_handles) > 1:
+                    driver.switch_to.window(driver.window_handles[-1])
+
                 # Continue with the application process
                 try:
                     # Dice "Easy Apply" is a multi-step wizard. Keep clicking "Next" until "Submit" appears.
@@ -377,11 +483,145 @@ def apply_to_job_url(driver, job_url):
                     )
 
                     # Fast polling so we click as soon as buttons appear (avoid long "Submit" waits)
-                    step_wait = WebDriverWait(driver, 12, poll_frequency=0.2)
-                    max_steps = 10
+                    # 20s timeout gives slow websites enough time to render each wizard step
+                    step_wait = WebDriverWait(driver, 20, poll_frequency=0.3)
+                    max_steps = 15
                     submitted = False
+                    has_uploaded_resume = False
+                    # Guard: how many consecutive times we have been on the resume
+                    # step without managing to upload. After MAX_RESUME_RETRIES we
+                    # give up and let the wizard continue so it doesn't get stuck.
+                    stuck_on_resume_count = 0
+                    MAX_RESUME_RETRIES = 1
 
                     for _ in range(max_steps):
+                        if pause_check and pause_check():
+                            driver.get(original_url)
+                            return False, selected_profile_name, "Stopped by user", "Bot stopped", job_desc_text, selected_profile_id
+
+                        # Detect if the Resume upload section is physically visible on the current wizard step (super fuzzy)
+                        is_resume_step = driver.execute_script("""
+                            return Array.from(document.querySelectorAll('h1, h2, h3, h4, span, legend, p'))
+                                .some(el => {
+                                    let t = (el.textContent || '').trim().toLowerCase();
+                                    return t.includes('resume & cover') || t === 'resume *' || t === 'resume' || t.includes('upload your resume') || t.includes('add resume');
+                                });
+                        """)
+                        
+                        if selected_resume_path and os.path.exists(selected_resume_path) and not has_uploaded_resume and is_resume_step:
+                            try:
+                                # Intelligently locate the native hidden Resume input, bypassing any blocking Dice UI / OS dialogues natively
+                                target_input = driver.execute_script("""
+                                    let inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+                                    let bestMatch = null;
+                                    
+                                    // Strip out the Cover Letter input definitively
+                                    let candidateInputs = inputs.filter(inp => {
+                                        let outer = inp.outerHTML.toLowerCase();
+                                        if (outer.includes('cover')) return false;
+                                        
+                                        // Walk up DOM to catch if it's trapped in a Cover Letter container
+                                        let node = inp;
+                                        let isCover = false;
+                                        for(let i=0; i<10; i++) {
+                                            if(node && node.parentElement) {
+                                                // Be careful: the entire page might contain "cover letter", so we look for tight bounds.
+                                                // Actually, checking its specific ID or name is safer.
+                                                if(node.id && node.id.toLowerCase().includes('cover')) isCover = true;
+                                                node = node.parentElement;
+                                            }
+                                        }
+                                        return !isCover;
+                                    });
+                                    
+                                    if (candidateInputs.length > 0) {
+                                        bestMatch = candidateInputs[0];
+                                    }
+                                    
+                                    // Make sure it is completely unrestricted for Selenium's internal upload
+                                    if (bestMatch) {
+                                        bestMatch.removeAttribute('disabled');
+                                        bestMatch.style.display = 'block';
+                                        bestMatch.style.visibility = 'visible';
+                                        bestMatch.style.opacity = '1';
+                                    }
+                                    return bestMatch;
+                                """)
+                                if target_input:
+                                    target_input.send_keys(selected_resume_path)
+                                    print(f"Uploaded mapped resume silently via DOM: {selected_resume_path}")
+                                    has_uploaded_resume = True
+                                    time.sleep(2)
+                                else:
+                                    # Fallback: Dice entirely pruned the input box from the DOM. We must manually trigger the Windows 'Replace' dialogue.
+                                    try:
+                                        # Click the '...' menu explicitly scoped to the active resume card
+                                        driver.execute_script("""
+                                            var headers = Array.from(document.querySelectorAll('h1, h2, h3, h4, span, div, p'))
+                                                .filter(el => el.textContent && (el.textContent.trim() === 'Resume *' || el.textContent.trim() === 'Resume'));
+                                            if (headers.length > 0) {
+                                                var header = headers[0];
+                                                var card = header.parentElement;
+                                                while (card && card.tagName !== 'BODY') {
+                                                    if (card.textContent.includes('Cover letter')) break;
+                                                    var contentStr = card.textContent.toLowerCase();
+                                                    if (contentStr.includes('uploaded') || contentStr.includes('.pdf') || contentStr.includes('.doc')) {
+                                                        var btns = card.querySelectorAll('button');
+                                                        if(btns.length > 0) {
+                                                            btns[btns.length - 1].click(); // Open the ... menu
+                                                            break;
+                                                        }
+                                                    }
+                                                    card = card.parentElement;
+                                                }
+                                            }
+                                        """)
+                                        time.sleep(0.5)
+                                        # Strictly click 'Replace' to execute the OS-level file prompt
+                                        driver.execute_script("""
+                                            var items = Array.from(document.querySelectorAll('div, li, span, button, a'))
+                                                .filter(el => {
+                                                    let t = (el.textContent || '').trim();
+                                                    return t === 'Replace';
+                                                });
+                                            for (var i=0; i<items.length; i++) {
+                                                var rect = items[i].getBoundingClientRect();
+                                                if (rect.width > 0 && rect.height > 0) {
+                                                    items[i].click();
+                                                    break;
+                                                }
+                                            }
+                                        """)
+                                        # Wait 2 seconds for the Windows Native Animation to launch and stabilize 
+                                        time.sleep(2.0)
+                                        
+                                        # Use standard pyautogui hooks to type the path into the active OS window
+                                        import subprocess
+                                        subprocess.run('clip.exe', text=True, input=selected_resume_path.strip())
+                                        time.sleep(0.5)
+                                        pyautogui.hotkey('ctrl', 'v')
+                                        time.sleep(0.5)
+                                        pyautogui.press('enter')
+                                        time.sleep(1.5)
+                                        
+                                        print(f"Uploaded mapped resume via Native Windows GUI string: {selected_resume_path}")
+                                        has_uploaded_resume = True
+                                    except Exception as e:
+                                        print(f"Native GUI injection fallback failed: {e}")
+                            except Exception as e:
+                                pass
+                                
+                        # If we're on the Resume wizard step and we haven't uploaded our mapped resume, don't skip to Next yet.
+                        # We allow up to MAX_RESUME_RETRIES attempts before giving up so the wizard never gets stuck.
+                        if is_resume_step and selected_resume_path and os.path.exists(selected_resume_path) and not has_uploaded_resume:
+                            stuck_on_resume_count += 1
+                            if stuck_on_resume_count < MAX_RESUME_RETRIES:
+                                print(f"Waiting to upload resume... attempt {stuck_on_resume_count}/{MAX_RESUME_RETRIES}")
+                                time.sleep(1.5)
+                                continue
+                            else:
+                                print(f"Resume upload failed after {MAX_RESUME_RETRIES} attempts — proceeding through wizard without it.")
+                                
                         # Check immediately for Submit/Next (no blocking waits that delay Next)
                         submit_candidates = driver.find_elements(*submit_locator)
                         submit_button = next((b for b in submit_candidates if b.is_displayed() and b.is_enabled()), None)
@@ -425,10 +665,20 @@ def apply_to_job_url(driver, job_url):
                             step_wait.until(_ready_button)
                             continue
 
-                        # Let the wizard step render/hydrate (staleness isn't always reliable with React)
-                        time.sleep(0.5)
+                        # Let the wizard step render/hydrate (staleness isn't always reliable with React).
+                        # 2.5s gives React/Angular SPA pages enough time to fully paint the next step
+                        # before the top-of-loop is_resume_step check fires.
+                        time.sleep(2.5)
                     
-                    # Wait for confirmation (Dice has multiple success UIs)
+                    # If we exhausted all steps without ever clicking Submit, record why
+                    if not submitted:
+                        skip_reason = "Wizard completed max steps but Submit button was never found"
+
+                    # Always wait a moment after Submit for the page to process the request
+                    # before checking for the success card – some sites take 3-5 seconds to respond
+                    if submitted:
+                        time.sleep(3.0)
+
                     try:
                         confirmation_wait = WebDriverWait(driver, 30)
                         confirmation_wait.until(
@@ -457,26 +707,50 @@ def apply_to_job_url(driver, job_url):
                             applied = True
                         except Exception as e:
                             print(f"Could not confirm application submission: {e}")
-                            applied = submitted
+                            if submitted:
+                                # Submit button was clicked but confirmation UI never appeared —
+                                # give benefit of the doubt; flag it in the reason for auditing
+                                applied = True
+                                skip_reason = "Submitted (Submit clicked) but confirmation UI not detected"
+                            else:
+                                # Submit was never clicked — wizard ran out of steps
+                                applied = False
+                                skip_reason = "Wizard finished all steps but Submit button was never clicked"
                         
                 except Exception as e:
                     applied = False
+                    skip_reason = f"Wizard error: {e}"
             else:
                 print("Failed to click Easy apply button")
                 applied = False
+                skip_reason = "Failed to click the Apply button"
         else:
             print(f"Unknown shadow DOM state: {status}")
             applied = False
+            skip_reason = f"Unknown apply button state: {status}"
             
     except Exception as e:
         print(f"Error in application process: {e}")
         applied = False
+        skip_reason = f"Exception during application: {e}"
         
-    # Always return to the original URL
+    # Always cleanly terminate any pop-up tabs and return to the original window/URL mapping
+    try:
+        if len(driver.window_handles) > 1:
+            for handle in driver.window_handles[1:]:
+                driver.switch_to.window(handle)
+                driver.close()
+        driver.switch_to.window(driver.window_handles[0])
+    except Exception:
+        pass
+        
+    # Give the browser a moment to fully settle after the application / popup close
+    # before navigating away, so any in-flight XHR from the submission can complete.
+    time.sleep(2.0)
     driver.get(original_url)
-    return applied
+    return applied, selected_profile_name, matched_reason, skip_reason, job_desc_text, selected_profile_id
 
-def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclude_keywords=None):
+def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclude_keywords=None, pause_check=None):
     """
     Use the existing browser instance to fetch job listings.
     """
@@ -486,7 +760,7 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
     encoded_query = quote(search_query)
     
     # Updated URL structure
-    base_url = f"https://www.dice.com/jobs?filters.employmentType=CONTRACTS&filters.postedDate=ONE&q={encoded_query}"
+    base_url = f"https://www.dice.com/jobs?filters.employmentType=THIRD_PARTY&filters.postedDate=ONE&q={encoded_query}"
     
     included_jobs = []
     excluded_jobs = []
@@ -516,48 +790,134 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
         pyautogui.moveRel(1, 1, duration=0.1)
         pyautogui.moveRel(-1, -1, duration=0.1)
         
-        # Get total jobs count
-        total_pages = 1
+        # Get total jobs count - use multiple fallback strategies, always default to at least 1 page
+        total_pages = 1  # Safe default: always try at least one page
         try:
-            print("Looking for job count element...")
+            print("Looking for job count or job cards...")
             
-            # Wait for the job count element with flexibility in the class name
-            job_count_element = medium_wait.until(
-                EC.presence_of_element_located((By.XPATH, "//p[contains(@class, 'text-neutral-900') and contains(text(), 'results')]"))
-            )
-            
-            total_jobs_text = job_count_element.text
-            print(f"Found job count text: '{total_jobs_text}'")
-            
-            total_jobs_match = re.search(r'(\d+)\s+results', total_jobs_text)
-            
-            if total_jobs_match:
-                total_jobs = int(total_jobs_match.group(1))
-                print(f"Total jobs for query '{search_query}': {total_jobs}")
-                
-                # 20 jobs per page
-                jobs_per_page = 20
-                total_pages = min(11, (total_jobs + jobs_per_page - 1) // jobs_per_page)
-                print(f"Will process {total_pages} pages ({jobs_per_page} jobs per page)")
+            # Wait up to 20s for the page to show EITHER the count text OR actual job cards OR body to be present
+            def find_page_state(d):
+                # Strategy 1: Look for the numerical results count text (multiple possible class names)
+                for xpath in [
+                    "//p[contains(@class, 'text-neutral-900') and contains(text(), 'results')]",
+                    "//p[contains(text(), 'results')]",
+                    "//*[contains(@class,'results-count')]",
+                    "//*[contains(@data-testid,'results-count')]",
+                ]:
+                    try:
+                        el = d.find_element(By.XPATH, xpath)
+                        if el and el.is_displayed() and el.text.strip():
+                            return {"type": "count", "element": el}
+                    except: pass
+
+                # Strategy 2: Job cards already rendered - great, proceed
+                try:
+                    cards = d.find_elements(By.CSS_SELECTOR, "div[data-id][data-job-guid]")
+                    if cards and len(cards) > 0:
+                        return {"type": "cards_only", "element": None}
+                except: pass
+
+                # Strategy 3: Page body is loaded - at minimum we can inspect it
+                try:
+                    body = d.find_element(By.TAG_NAME, "body")
+                    if body and body.is_displayed():
+                        return {"type": "body_only", "element": None}
+                except: pass
+
+                return False
+
+            state_result = short_wait.until(find_page_state)
+
+            if state_result["type"] == "count":
+                job_count_element = state_result["element"]
+                total_jobs_text = job_count_element.text
+                print(f"Found job count text: '{total_jobs_text}'")
+
+                total_jobs_match = re.search(r'([\d,]+)\s+results', total_jobs_text)
+                if total_jobs_match:
+                    total_jobs = int(total_jobs_match.group(1).replace(',', ''))
+                    print(f"Total jobs for query '{search_query}': {total_jobs}")
+                    if total_jobs <= 0:
+                        print(f"Zero jobs returned for '{search_query}' — skipping.")
+                        total_pages = 0
+                    else:
+                        jobs_per_page = 20
+                        total_pages = min(11, (total_jobs + jobs_per_page - 1) // jobs_per_page)
+                        print(f"Will process {total_pages} pages ({jobs_per_page} jobs per page)")
+                else:
+                    print(f"Could not parse job count from '{total_jobs_text}'. Defaulting to 3 pages.")
+                    total_pages = 3
+
+            elif state_result["type"] == "cards_only":
+                print("Job cards already visible, no count text found. Defaulting to 3 pages.")
+                total_pages = 3
+
             else:
-                print(f"Could not extract job count from: {total_jobs_text}")
-                total_pages = 3  # Default to 3 pages
-            
+                # body_only or unknown — page loaded but we could not confirm jobs exist; try 1 page
+                print(f"Page body loaded but no job count or cards detected yet for '{search_query}'. Will try 1 page.")
+                total_pages = 1
+
         except Exception as e:
-            print(f"Could not find total job count, defaulting to 3 pages: {str(e)}")
-            total_pages = 3
+            print(f"Could not detect page state for query '{search_query}': {e}. Trying 1 page anyway.")
+            total_pages = 1
         
         # Process each page
         for page in range(1, total_pages + 1):
+            if pause_check and pause_check():
+                print("Fetching jobs stopped by user.")
+                break
+            
             current_url = base_url if page == 1 else f"{base_url}&page={page}"
             print(f"Processing page {page}/{total_pages}: {current_url}")
             
             if page > 1:  # Only need to navigate if not on first page
                 try:
-                    driver.get(current_url)
-                    short_wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                    print(f"Navigating to page {page} by clicking 'Next'...")
+                    clicked = driver.execute_script("""
+                        let nextBtns = Array.from(document.querySelectorAll('a, button, span, li')).filter(el => {
+                            let text = (el.textContent || '').trim().toLowerCase();
+                            let aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                            let cls = (el.className || '').toLowerCase();
+                            
+                            // Prevent picking disabled buttons
+                            if (el.disabled || el.getAttribute('aria-disabled') === 'true' || cls.includes('disabled')) return false;
+                            
+                            if (text === 'next' || text === 'next »' || text === '>') return true;
+                            if (aria === 'next' || aria === 'next page') return true;
+                            if (cls.includes('pagination-next') || cls.includes('next-page')) return true;
+                            return false;
+                        });
+                        
+                        let visible = nextBtns.filter(el => {
+                            let rect = el.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0 && 
+                                   window.getComputedStyle(el).display !== 'none' &&
+                                   window.getComputedStyle(el).visibility !== 'hidden';
+                        });
+                        
+                        if (visible.length > 0) {
+                            let target = visible[visible.length - 1]; // Pick the last matching element (usually the bottom pagination)
+                            if (target.tagName === 'LI' && target.querySelector('a, button')) {
+                                target = target.querySelector('a, button');
+                            }
+                            target.scrollIntoView({block: 'center', inline: 'nearest'});
+                            target.click();
+                            return true;
+                        }
+                        return false;
+                    """)
+                    
+                    if not clicked:
+                        print("Next button not found. Falling back to URL parameter...")
+                        driver.get(current_url)
+                        time.sleep(3)
+                    else:
+                        print("Clicked 'Next' physically on UI!")
+                        # Wait for the React/Angular framework to fetch new cards and refresh the DOM
+                        time.sleep(4.0)
+                        
                 except Exception as e:
-                    print(f"Error loading page {page}: {e}")
+                    print(f"Error navigating to page {page} (will retry or continue): {e}")
                     continue
             
             # Wait for job cards to appear with a more specific selector based on example
@@ -565,7 +925,7 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                 print("Waiting for job cards to load...")
                 
                 # NEW APPROACH: Wait specifically for job cards using data attributes
-                medium_wait.until(
+                short_wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-id][data-job-guid]"))
                 )
                 
@@ -583,6 +943,10 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                 
                 # Process each job card
                 for card_index, card in enumerate(job_cards):
+                    if pause_check and pause_check():
+                        print("Fetching jobs stopped by user.")
+                        return included_jobs, excluded_jobs
+                        
                     try:
                         # Get job ID and URL from data attributes
                         job_id = card.get_attribute('data-id')
@@ -615,7 +979,7 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                         job_location = location_elements[0].text.strip() if location_elements else "Unknown"
                         
                         # Extract employment type from the box with specific ID
-                        job_employment_type = "Contract"  # Default since we're filtering for contracts
+                        job_employment_type = "THIRD PARTY"  # Default since we're filtering for contracts
                         try:
                             emp_type_element = card.find_element(
                                 By.CSS_SELECTOR, 
@@ -628,7 +992,7 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                             try:
                                 box_elements = card.find_elements(By.CSS_SELECTOR, "div.box p")
                                 for element in box_elements:
-                                    if "Contract" in element.text:
+                                    if "THIRD PARTY" in element.text:
                                         job_employment_type = element.text.strip()
                                         break
                             except:
@@ -648,21 +1012,84 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                             "Applied": False
                         }
                         
-                        # Apply filtering
+                        # ── Hardcoded W2 block ────────────────────────────────────────────
+                        # W2-only roles are never wanted. BUT if a job mentions BOTH W2 AND
+                        # C2C/Corp-to-Corp it means C2C is also accepted — keep those.
+                        W2_PATTERNS = [
+                            r'\bW2\b', r'\bW-2\b', r'\bW 2\b',
+                            r'\bW2 Only\b', r'\bW2only\b',
+                            r'\bFull[- ]?Time\b',   # FT-only postings are not contract
+                        ]
+                        # These signal that C2C is also accepted — override the W2 block
+                        C2C_PATTERNS = [
+                            r'\bC2C\b', r'\bCorp[- ]?to[- ]?Corp\b',
+                            r'\bContract[- ]?to[- ]?Contract\b',
+                            r'\bC2H\b', r'\bContract[- ]?to[- ]?Hire\b',
+                        ]
+                        try:
+                            card_text = card.text  # All visible text in the card
+                        except Exception:
+                            card_text = ""
+                        
+                        # Check if C2C is mentioned anywhere in the card
+                        all_card_text = f"{job_title} {job_employment_type} {card_text}"
+                        has_c2c = any(
+                            re.search(p, all_card_text, re.IGNORECASE) for p in C2C_PATTERNS
+                        )
+                        
+                        w2_hit = False
+                        w2_hit_reason = ""
+                        if not has_c2c:
+                            # Only apply the W2 block when C2C is NOT also offered
+                            for pat in W2_PATTERNS:
+                                for source_text, source_name in [
+                                    (job_title, "title"),
+                                    (job_employment_type, "employment-type"),
+                                    (card_text, "card-body"),
+                                ]:
+                                    if re.search(pat, source_text, re.IGNORECASE):
+                                        w2_hit = True
+                                        w2_hit_reason = f"W2-only detected in {source_name}: '{pat}'"
+                                        break
+                                if w2_hit:
+                                    break
+                        
+                        if w2_hit:
+                            job_entry["Exclusion Reason"] = w2_hit_reason
+                            excluded_jobs.append(job_entry)
+                            print(f"  [W2 SKIP] {job_title} — {w2_hit_reason}")
+                            continue
+                        elif has_c2c and any(re.search(p, all_card_text, re.IGNORECASE) for p in W2_PATTERNS):
+                            # W2 + C2C together — keep it but log it
+                            print(f"  [W2+C2C KEEP] {job_title} — C2C also offered, keeping job")
+                        # ─────────────────────────────────────────────────────────────────
+                        
+                        # Apply user-defined keyword filtering
                         include_job = True
                         exclusion_reason = ""
-                        job_title_lower = job_title.lower()
-                        
-                        # Check exclude keywords
-                        if exclude_keywords and any(keyword.lower() in job_title_lower for keyword in exclude_keywords):
-                            matching_keywords = [kw for kw in exclude_keywords if kw.lower() in job_title_lower]
-                            exclusion_reason = f"Contains excluded keywords: {', '.join(matching_keywords)}"
-                            include_job = False
+
+                        # Check exclude keywords (title only — user-defined)
+                        if exclude_keywords:
+                            matching_excludes = []
+                            for kw in exclude_keywords:
+                                pat = ResumeMatcher.build_keyword_pattern(kw)
+                                if pat and re.search(pat, job_title, re.IGNORECASE):
+                                    matching_excludes.append(kw)
+                            if matching_excludes:
+                                exclusion_reason = f"Contains excluded keywords: {', '.join(matching_excludes)}"
+                                include_job = False
                         
                         # Check include keywords
-                        if include_keywords and not any(keyword.lower() in job_title_lower for keyword in include_keywords):
-                            exclusion_reason = f"Missing required keywords: {', '.join(include_keywords)}"
-                            include_job = False
+                        if include_keywords and include_job:
+                            found_include = False
+                            for kw in include_keywords:
+                                pat = ResumeMatcher.build_keyword_pattern(kw)
+                                if pat and re.search(pat, job_title, re.IGNORECASE):
+                                    found_include = True
+                                    break
+                            if not found_include:
+                                exclusion_reason = f"Missing required keywords: {', '.join(include_keywords)}"
+                                include_job = False
                         
                         if include_job:
                             included_jobs.append(job_entry)
@@ -677,7 +1104,8 @@ def fetch_jobs_with_requests(driver, search_query, include_keywords=None, exclud
                 total_jobs_found += len(job_cards)
                 
             except Exception as e:
-                print(f"Error processing job cards on page {page}: {str(e)}")
+                print(f"Error processing job cards on page {page} (timeout reached). Stopping page traversal: {str(e)}")
+                break # Stop processing subsequent pages if current page fails or has no cards
                 
     except Exception as e:
         print(f"Error during job fetching: {str(e)}")
@@ -783,7 +1211,7 @@ def main():
             # Rest of your code stays the same...
             # Check for already applied jobs
             if not os.path.exists(not_applied_jobs_file):
-                df_empty = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
+                df_empty = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied", "Resume Profile", "Match Reason", "Skip Reason"])
                 df_empty.to_excel(not_applied_jobs_file, index=False)
                 
             existing_applied_jobs = set()
@@ -829,26 +1257,34 @@ def main():
                 job_start_time = time.time()
                 
                 if not job["Applied"] and job["Job URL"] != "Unknown":
-                    applied = apply_to_job_url(driver, job["Job URL"])
+                    applied, profile_used, reason, skip_reason = apply_to_job_url(
+                        driver, job["Job URL"], [], job_title=job.get("Job Title", "")
+                    )
                     job["Applied"] = applied
+                    job["Resume Profile"] = profile_used
+                    job["Match Reason"] = reason
                     
                     job_time = time.time() - job_start_time
                     
                     if applied:
                         successful_applications += 1
+                        # Store any audit note (e.g. submitted but confirmation not detected)
+                        if skip_reason:
+                            job["Application Note"] = skip_reason
                         try:
                             df_existing = pd.read_excel(applied_jobs_file)
                         except Exception:
-                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
+                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied", "Resume Profile", "Match Reason", "Application Note"])
                         df_new = pd.DataFrame([job])
                         df_combined = pd.concat([df_existing, df_new], ignore_index=True)
                         df_combined.to_excel(applied_jobs_file, index=False)
                     else:
                         failed_applications += 1
+                        job["Skip Reason"] = skip_reason
                         try:
                             df_existing = pd.read_excel(not_applied_jobs_file)
                         except Exception:
-                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied"])
+                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company", "Location", "Employment Type", "Posted Date", "Applied", "Resume Profile", "Match Reason", "Skip Reason"])
                         df_new = pd.DataFrame([job])
                         df_combined = pd.concat([df_existing, df_new], ignore_index=True)
                         df_combined.to_excel(not_applied_jobs_file, index=False)
@@ -864,6 +1300,78 @@ def main():
                               f"Last job: {job_time:.1f}s | "
                               f"Success rate: {successful_applications}/{job_index+1} | "
                               f"Est. remaining: {remaining/60:.1f} mins")
+
+            # ── Retry pass ────────────────────────────────────────────────────
+            # Re-attempt jobs that failed due to transient issues (button timeout,
+            # wizard not finding Submit, etc.).  Only ONE retry per job.
+            RETRYABLE_REASONS = [
+                "Apply button not found or timed out",
+                "Wizard completed max steps but Submit button was never found",
+                "Wizard finished all steps but Submit button was never clicked",
+                "Failed to click the Apply button",
+                "Wizard error",
+                "Exception during application",
+            ]
+            retry_candidates = [
+                job for job in pending_jobs
+                if not job.get("Applied", False)
+                and any(r in job.get("Skip Reason", "") for r in RETRYABLE_REASONS)
+            ]
+
+            if retry_candidates:
+                print(f"\n==========> Retrying {len(retry_candidates)} failed job(s)...")
+                retry_success = 0
+                retry_fail    = 0
+
+                for job in retry_candidates:
+                    print(f"  Retrying: {job.get('Job Title', 'Unknown')} | Previous reason: {job.get('Skip Reason', '')}")
+                    time.sleep(3.0)  # Brief pause before each retry
+
+                    applied, profile_used, reason, skip_reason = apply_to_job_url(
+                        driver, job["Job URL"], []
+                    )
+                    job["Applied"]        = applied
+                    job["Resume Profile"] = profile_used
+                    job["Match Reason"]   = reason
+                    job["Skip Reason"]    = skip_reason if not applied else job.get("Skip Reason", "")
+
+                    if applied:
+                        retry_success        += 1
+                        successful_applications += 1
+                        failed_applications     -= 1
+                        # Write to applied_jobs
+                        try:
+                            df_existing = pd.read_excel(applied_jobs_file)
+                        except Exception:
+                            df_existing = pd.DataFrame(columns=["Job Title", "Job URL", "Company",
+                                "Location", "Employment Type", "Posted Date", "Applied",
+                                "Resume Profile", "Match Reason"])
+                        df_combined = pd.concat([df_existing, pd.DataFrame([job])], ignore_index=True)
+                        df_combined.to_excel(applied_jobs_file, index=False)
+                        # Remove from not_applied_jobs if it was written there
+                        try:
+                            df_not = pd.read_excel(not_applied_jobs_file)
+                            df_not = df_not[df_not["Job URL"] != job["Job URL"]]
+                            df_not.to_excel(not_applied_jobs_file, index=False)
+                        except Exception:
+                            pass
+                        print(f"    ✓ Retry succeeded for: {job.get('Job Title', 'Unknown')}")
+                    else:
+                        retry_fail += 1
+                        job["Skip Reason"] = f"[Retry] {skip_reason}"
+                        # Update the existing not_applied row
+                        try:
+                            df_not = pd.read_excel(not_applied_jobs_file)
+                            if job["Job URL"] in df_not["Job URL"].values:
+                                df_not.loc[df_not["Job URL"] == job["Job URL"], "Skip Reason"] = job["Skip Reason"]
+                            else:
+                                df_not = pd.concat([df_not, pd.DataFrame([job])], ignore_index=True)
+                            df_not.to_excel(not_applied_jobs_file, index=False)
+                        except Exception:
+                            pass
+                        print(f"    ✗ Retry failed for: {job.get('Job Title', 'Unknown')} | {skip_reason}")
+
+                print(f"==========> Retry results: {retry_success} succeeded, {retry_fail} still failed")
 
             apply_time = time.time() - apply_start_time
             applications_per_minute = (successful_applications + failed_applications) / (apply_time / 60) if apply_time > 0 else 0
