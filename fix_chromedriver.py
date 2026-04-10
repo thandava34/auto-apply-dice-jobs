@@ -1,5 +1,16 @@
 # dice_auto_apply/fix_chromedriver.py
 
+"""
+ChromeDriver Permission Fixer
+=============================
+
+This utility script is responsible for automatically resolving OS-level permission 
+issues that commonly prevent Selenium from launching the webdriver manager binaries.
+
+Particularly on macOS and strict Linux environments, downloaded binaries lack 
+the `+x` execution flag or are trapped by Apple's Gatekeeper (quarantine).
+"""
+
 import os
 import stat
 import glob
@@ -7,7 +18,18 @@ import platform
 import subprocess
 
 def fix_chromedriver_permissions():
-    """Fix permissions on ChromeDriver executable"""
+    """
+    Locates cached ChromeDriver binaries within the `~/.wdm/` directory 
+    and forcefully patches their OS-level permissions.
+    
+    Operations performed:
+    - Adds global execute (`+x`) permissions via `os.chmod`.
+    - (macOS only) Deletes the `com.apple.quarantine` extended attribute to 
+      bypass Gatekeeper 'unidentified developer' popups.
+      
+    Returns:
+        bool: True if at least one driver was found and successfully patched, False otherwise.
+    """
     print("Fixing ChromeDriver permissions...")
     
     # Get user's home directory

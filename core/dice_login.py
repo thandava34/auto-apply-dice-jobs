@@ -1,3 +1,13 @@
+"""
+Dice Login Automation
+=====================
+
+This module handles the complex process of securely authenticating the bot 
+with the Dice.com platform. It features robust waiting mechanisms, dynamic
+URL checking, and headless validation routines to bypass Dice's multi-step
+login UI and occasional captchas/slow-loading pages.
+"""
+
 import os
 import time
 from pathlib import Path
@@ -12,13 +22,14 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 def update_dice_credentials(username, password, update_env=True):
     """
-    Updates the Dice credentials in the .env file.
-    
+    Persistently stores the successfully verified Dice credentials in the `.env` file
+    to bypass needing to re-enter them on subsequent executions.
+
     Parameters:
         username (str): Dice account email/username
         password (str): Dice account password
         update_env (bool): Whether to update the .env file or not
-        
+
     Returns:
         bool: True if credentials were updated successfully
     """

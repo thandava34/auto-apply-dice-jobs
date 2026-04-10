@@ -28,9 +28,11 @@ class ConfigManager:
                 "include_keywords": ["AI", "Artificial","Inteligence","Machine","Learning", "ML", "Data", "NLP", "ETL",
         "Natural Language Processing","analyst","scientist","senior","cloud", 
         "aws","gcp","Azure","agentic","python","rag","llm"],
+        		"resume_profiles": [],
                 "headless_mode": False,
                 "job_application_limit": 50,
-                "save_logs": True
+                "save_logs": True,
+                "profile_name_boost_mode": "high"
             }
             
             # Write default config to file
@@ -42,7 +44,13 @@ class ConfigManager:
         # Load existing config
         try:
             with open(self.config_file, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+            # Backfill any keys added after initial install
+            if 'profile_name_boost_mode' not in data:
+                # Migrate old bool key if present
+                old_val = data.pop('profile_name_boost', None)
+                data['profile_name_boost_mode'] = 'off' if old_val is False else 'high'
+            return data
         except Exception as e:
             print(f"Error loading config: {e}")
             return {}
