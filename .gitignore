@@ -30,7 +30,13 @@ Desktop.ini
 code_reader.py
 
 # AI model cache (large downloaded files, ~80MB — users download on first run)
-models/
+models/*
+!models/.gitkeep
 
 # Local AI learning database (contains private application history)
-data/
+data/*
+!data/.gitkeep
+
+# Logs (auto-generated, excluded from repo)
+logs/*
+!logs/.gitkeep

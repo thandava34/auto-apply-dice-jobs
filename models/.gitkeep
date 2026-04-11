@@ -1,0 +1,3 @@
+# This folder stores the downloaded AI model cache (sentence-transformers/all-MiniLM-L6-v2).
+# The model (~80MB) is automatically downloaded on first run — it is NOT included in the repo.
+# Do not delete this folder.
