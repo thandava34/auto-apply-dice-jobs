@@ -1,0 +1,3 @@
+# This folder stores the AI learning database (learning_v3.db).
+# It is auto-created when you first run the bot or train the AI.
+# The database is excluded from Git as it contains your private application history.

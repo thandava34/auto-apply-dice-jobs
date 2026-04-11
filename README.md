@@ -21,9 +21,54 @@ Watch a complete demonstration of how to set up and use the Dice Auto Apply Bot:
 The video shows step-by-step instructions for installation, configuration, and running the application on both Windows and Mac.
 
 ## Prerequisites
-- Python 3.x installed.
+- Python 3.8+ installed.
 - A web browser (preferably Brave Browser, but Chrome, Firefox, Edge or Safari will also work).
 - Git (optional) if you wish to clone the repository.
+
+---
+
+## Project Structure
+
+```
+auto-apply-dice-jobs/
+│
+├── run.py                     # ← START HERE: Main entry point
+├── app_tkinter.py             # Tkinter GUI application
+├── fix_chromedriver.py        # Fixes webdriver permissions on Mac/Linux
+├── test_ai_integration.py     # AI integration test script
+├── requirements.txt           # Python dependencies
+│
+├── core/
+│   ├── main_script.py         # Selenium automation & job application logic
+│   ├── matcher.py             # TF-IDF + Jaccard resume scoring engine
+│   ├── semantic_matcher.py    # AI semantic matching (sentence-transformers)
+│   ├── learning_engine.py     # SQLite AI memory & training database
+│   ├── browser_detector.py    # Auto-detects installed browsers
+│   ├── dice_login.py          # Dice.com login automation
+│   └── file_utils.py          # PDF/DOCX resume text extractor
+│
+├── config/
+│   └── settings.json          # Your job search settings & resume profiles
+│
+├── utils/
+│   ├── config_manager.py      # Settings read/write helper
+│   └── log_manager.py         # Log file management
+│
+├── resources/
+│   └── app_icon.png           # Application window icon
+│
+├── models/                    # ← Auto-created: AI model cache (~80MB, downloaded on first run)
+├── data/                      # ← Auto-created: AI learning database (your private history)
+├── logs/                      # ← Auto-created: Session log files
+│
+├── applied_jobs.xlsx          # ← Auto-created: Successfully applied jobs
+├── not_applied_jobs.xlsx      # ← Auto-created: Skipped jobs with reasons
+└── excluded_jobs.xlsx         # ← Auto-created: Keyword-excluded jobs
+```
+
+> **Note:** Files and folders marked **"Auto-created"** do not exist in the repo — the bot creates them automatically on first run. You do not need to create them manually.
+
+---
 
 ## Installation
 
