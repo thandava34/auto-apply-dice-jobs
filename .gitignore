@@ -15,6 +15,9 @@ job_data.json
 job_application_summary.json
 *.txt
 
+# Personal settings — contains private resume paths and profile data
+config/settings.json
+
 # Logs
 logs/*.log
 
