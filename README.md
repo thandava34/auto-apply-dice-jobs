@@ -73,10 +73,10 @@ auto-apply-dice-jobs/
 ## Installation
 
 ### Clone the Repository
-Copy and run these commands:
+Copy and run these commands:( Download Zip File)
 
 ```bash
-git clone https://github.com/yuva-raja-reddy/auto-apply-dice-jobs.git
+git clone https://github.com/thandava34/auto-apply-dice-jobs.git
 cd auto-apply-dice-jobs
 ```
 
