@@ -14,7 +14,7 @@ Dice Auto Apply Bot is a Python-based application that automates your job applic
 
 ## Demo Video
 
-Watch a complete demonstration of how to set up and use the Dice Auto Apply Bot:
+Watch a complete demonstration of how to set up and use the Dice Auto Apply Bot (V1):
 
 [![Watch the Demo Video](https://img.shields.io/badge/Watch-Demo_Video-red?style=for-the-badge&logo=google-drive&logoColor=white)](https://drive.google.com/file/d/1c0Y69PZ5UlFb3dZg0_-_wn7UibRQQwlW/view?usp=sharing)
 
@@ -361,4 +361,4 @@ Feel free to fork this repository and submit pull requests for improvements, add
 ## Support
 If you find this project useful, please consider supporting its development:
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/yuvarajareddy)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](buymeacoffee.com/thandava62d)
