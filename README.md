@@ -180,6 +180,7 @@ The bot supports **multiple resume profiles**. Each profile maps a specific resu
 3. Fill in the following fields:
    - **Profile Name** — A descriptive label (e.g. `Data Engineer`, `ML Engineer`). This name is compared against job titles for smart auto-selection.
    - **Resume File** — Click **Browse** to select your `.pdf` or `.docx` resume file.
+   **- NOTE: If you Want to Use AI Help The Prompt is Here use the Prompt to add skills into the Profile [[ Resume_Skills_Prompt.md]]**
    - **Unique Keywords** — Skills that are *specific* to this role and carry **3× weight** (e.g. `Airflow`, `dbt`, `Spark`). These are your strongest signals.
    - **General Keywords** — Broader skills at **1× weight** (e.g. `Python`, `SQL`, `AWS`).
    - **Boost Mode** — Controls how strongly the profile name influences resume selection:
