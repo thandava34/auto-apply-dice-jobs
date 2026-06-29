@@ -8,6 +8,9 @@ venv/
 ENV/
 .env
 
+# Selenium persistent browser profile
+browser_profile/
+
 # Excel and data files
 *.xlsx
 *.xls
@@ -42,4 +45,4 @@ data/*
 
 # Logs (auto-generated, excluded from repo)
 logs/*
-!logs/.gitkeep
+!logs/.gitkeep
