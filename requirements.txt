@@ -6,11 +6,6 @@ webdriver_manager==4.0.2
 pyautogui==0.9.54
 requests==2.32.3
 beautifulsoup4==4.13.3
-
-# AI & Machine Learning
-torch>=2.0.0
-sentence-transformers>=2.2.2
-numpy>=1.21.0
 sqlite-utils
 
 # Resume Parsing
