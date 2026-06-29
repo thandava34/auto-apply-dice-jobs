@@ -12,23 +12,33 @@ Key Responsibilities:
 2. Intercepts the startup sequence to execute `fix_chromedriver_permissions`. 
    This safely handles OS-level execution blockers that commonly prevent 
    Selenium webdrivers from launching natively on Mac/Linux or restricted Windows setups.
-3. Bootstraps the main Tkinter Window loop housed within `app_tkinter.py`.
+3. Loads browser session patching so Dice cookies are preserved between runs.
+4. Bootstraps the main Tkinter Window loop housed within `app_tkinter.py`.
 """
 import os
 import sys
+
 
 def main():
     """
     Main entry point for the application.
     
     Dynamically injects the target directory into sys.path ensuring imports resolve 
-    correctly, patches the selenium chromedriver binaries, and handles top-level
-    import failures gracefully by printing an explicit traceback to terminal.
+    correctly, patches the selenium chromedriver binaries, applies browser session
+    stability patching, and handles top-level import failures gracefully by printing
+    an explicit traceback to terminal.
     """
     # Add the current directory to Python path
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
+
+    # Keep Dice cookies/session data across runs and prevent incognito resets.
+    try:
+        import browser_session_patch
+        browser_session_patch.patch_selenium_chrome_options()
+    except Exception as e:
+        print(f"Warning: Could not apply browser session patch: {e}")
     
     # Fix chromedriver permissions
     try:
@@ -47,6 +57,7 @@ def main():
         print(f"Reason: {e}")
         traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
