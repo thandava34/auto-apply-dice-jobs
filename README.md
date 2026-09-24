@@ -152,6 +152,17 @@ Optional services:
 
 ## Quick setup
 
+Clone this repository, or use GitHub's **Code → Download ZIP** and extract it:
+
+```bash
+git clone https://github.com/thandava34/auto-apply-dice-jobs.git
+cd auto-apply-dice-jobs
+```
+
+The [original Dice demo (V1)](https://drive.google.com/file/d/1c0Y69PZ5UlFb3dZg0_-_wn7UibRQQwlW/view?usp=sharing) covers the earlier interface; use the instructions below for the current version.
+
+For help reviewing profile skills, see [Resume Skill Prompt](Resume_Skill_Prompt.md). Verify any suggested skills against your actual résumé before adding them to a profile.
+
 ### Windows PowerShell
 
 ```powershell
@@ -786,3 +797,7 @@ were used for this validation.
 Automated local status as of 2026-09-10: 57 tests plus 3 provider dispatch subtests passed, compilation and both-application imports passed. Both GUIs were constructed in hidden test windows. An isolated Chrome form fixture passed cookie targeting, answer handoff, radio selection, and post-fill checks. Live login and provider behavior still require account-specific validation.
 
 That does not certify changing third-party web interfaces. Complete the provider-specific live checklist before unattended use. The phased follow-up plan, acceptance criteria, CI recommendation, adapter isolation, and operational controls are documented in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).
+
+## Support
+
+[Buy Me a Coffee](https://buymeacoffee.com/thandava62d)
