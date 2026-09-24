@@ -39,6 +39,8 @@ import os
 import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
+from utils.ui_components import ToggleSwitch, LabeledToggleSwitch
+from utils.power_utils import prevent_sleep, allow_sleep
 import threading
 import pandas as pd
 from datetime import datetime
@@ -53,6 +55,8 @@ try:
     from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
     from core.main_script import get_web_driver, fetch_jobs_with_requests, apply_to_job_url
     from core.semantic_matcher import SemanticResumeMatcher
+    from core.groq_resume_scorer import GroqResumeScorer
+    from core.application_answers import application_question_catalog_items
 except ImportError:
     # Attempt parent-directory relative imports if normal ones fail
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +66,8 @@ except ImportError:
     from core.dice_login import login_to_dice, update_dice_credentials, validate_dice_credentials
     from core.main_script import get_web_driver, fetch_jobs_with_requests, apply_to_job_url
     from core.semantic_matcher import SemanticResumeMatcher
+    from core.groq_resume_scorer import GroqResumeScorer
+    from core.application_answers import application_question_catalog_items
 
 
 
@@ -78,34 +84,106 @@ def fix_imports():
 # Call this at the beginning of your script
 fix_imports()
 
+
+
 class DiceAutoBotApp:
     def __init__(self, root):
         self.root = root
+        from utils.ui_events import install_ui_events
+        install_ui_events(root)
         self.root.title("Dice Auto Apply Bot")
-        
-        # Prevent the window from silently shrinking if monitor resolution is 1366x768 or scaled
-        self.root.geometry("1100x820")
-        
+
+        # ── Adaptive sizing: fit the window to whatever screen it opens on ──
+        self.root.update_idletasks()  # ensure winfo_* values are ready
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+
+        # Target 88% of screen, capped at reasonable maximums
+        win_w = min(int(sw * 0.88), 1300)
+        win_h = min(int(sh * 0.88), 900)
+        # Never let window be smaller than a usable minimum
+        win_w = max(win_w, 860)
+        win_h = max(win_h, 600)
+
+        # Centre the window on the primary screen
+        x_pos = max(0, (sw - win_w) // 2)
+        y_pos = max(0, (sh - win_h) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{x_pos}+{y_pos}")
+        self.root.minsize(860, 600)
+        self.root.resizable(True, True)
+
+        # ── Unified dark color palette (matches Outreach Bot) ────────────────
+        from utils.desktop_theme import legacy_palette
+        palette = legacy_palette()
+        BG, PANEL, ENTRY_BG = palette['BG'], palette['PANEL'], palette['ENTRY_BG']
+        BORDER, FG, FG2 = palette['BORDER'], palette['FG'], palette['FG2']
+        CARD_B = CARD_G = CARD_Y = PANEL
+        CARD_R = PANEL
+        self._theme = dict(
+            BG=BG, PANEL=PANEL, BORDER=BORDER, FG=FG, FG2=FG2,
+            ENTRY_BG=ENTRY_BG, CARD_B=CARD_B, CARD_G=CARD_G,
+            CARD_Y=CARD_Y, CARD_R=CARD_R
+        )
+        self.root.configure(bg=BG)
+
         # Override rigid native OS themes with 'clam' so custom padding and fonts reliably work
         style = ttk.Style()
         style.theme_use('clam')
 
-        # ── Rich global styles ───────────────────────────────────────────────
+        # ── Rich global dark styles ──────────────────────────────────────────
         BASE_FONT  = ("Segoe UI", 10)
         BOLD_FONT  = ("Segoe UI", 10, "bold")
         SMALL_FONT = ("Segoe UI", 8)
 
-        style.configure(".",            font=BASE_FONT)
-        style.configure("TLabel",       font=BASE_FONT, padding=2)
-        style.configure("TEntry",       padding=4)
-        style.configure("TButton",      padding=(8, 4), font=BASE_FONT)
-        style.configure("TLabelframe",  padding=6)
-        style.configure("TLabelframe.Label", font=BOLD_FONT)
-        style.configure("TNotebook.Tab", padding=[18, 7], font=BOLD_FONT, background="#e8e8e8")
-        style.map("TNotebook.Tab",      background=[("selected", "#d0e8ff")])
-        style.configure("Treeview",     rowheight=28, font=BASE_FONT)
-        style.configure("Treeview.Heading", font=BOLD_FONT, background="#d0d0d0")
-        style.configure("Horizontal.TProgressbar", background="#28a745", troughcolor="#e9ecef")
+        style.configure(".",               font=BASE_FONT, background=PANEL, foreground=FG)
+        style.configure("TFrame",          background=PANEL)
+        style.configure("TLabel",          font=BASE_FONT, background=PANEL, foreground=FG, padding=2)
+        style.configure("TEntry",          fieldbackground=ENTRY_BG, foreground=FG, insertcolor=FG, padding=5)
+        style.configure("TButton",         padding=(8, 4), font=BASE_FONT)
+        style.map("TButton",               background=[("active", "#424b6b"), ("disabled", "#2d3550")], foreground=[("disabled", "#9aa3c2")])
+        style.configure("TCheckbutton",    background=PANEL, foreground=FG, font=BASE_FONT)
+        style.map("TCheckbutton",          background=[("active", PANEL)])
+        style.configure("TCombobox",       fieldbackground=ENTRY_BG, foreground=FG, background=PANEL, padding=4)
+        style.map("TCombobox",             fieldbackground=[("readonly", ENTRY_BG)], foreground=[("readonly", FG)], background=[("active", "#424b6b")])
+        style.configure("TSpinbox",        fieldbackground=ENTRY_BG, foreground=FG, insertcolor=FG)
+        style.configure("TLabelframe",     background=PANEL, relief="groove")
+        style.configure("TLabelframe.Label", font=BOLD_FONT, background=PANEL, foreground="#7dd3fc")
+        style.configure("TNotebook",       background=BG, tabmargins=[2, 4, 2, 0])
+        style.configure("TNotebook.Tab",   padding=[18, 9], font=BOLD_FONT, background="#252b3b", foreground=FG2)
+        style.map("TNotebook.Tab",         background=[("selected", PANEL)], foreground=[("selected", FG)])
+        style.configure("TScrollbar",      background=BORDER, troughcolor=PANEL)
+        style.configure("Treeview",        rowheight=28, font=BASE_FONT,
+                         background=ENTRY_BG, foreground=FG, fieldbackground=ENTRY_BG)
+        style.configure("Treeview.Heading", font=BOLD_FONT, background=PANEL, foreground="#7dd3fc")
+        style.map("Treeview",              background=[("selected", "#2563eb")], foreground=[("selected", "white")])
+        style.configure("Horizontal.TProgressbar", background="#16a34a", troughcolor=ENTRY_BG)
+
+        # ── Named button styles ──────────────────────────────────────────────
+        for name, bg, abg in [
+            ("Start",   "#16a34a", "#15803d"),
+            ("Stop",    "#dc2626", "#b91c1c"),
+            ("Blue",    "#2563eb", "#1d4ed8"),
+            ("Amber",   "#d97706", "#b45309"),
+            ("Skip",    "#7c3aed", "#6d28d9"),
+        ]:
+            style.configure(f"{name}.TButton",
+                background=bg, foreground="white",
+                font=BOLD_FONT, padding=(10, 6), relief="flat")
+            style.map(f"{name}.TButton",
+                background=[("active", abg), ("disabled", "#374151")])
+
+        # ── Dark Header Banner ───────────────────────────────────────────────
+        header = tk.Frame(self.root, bg=BG, height=58)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="Career-Ops · Dice | Job applications",
+                 bg=BG, fg="#93c5fd",
+                 font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT, padx=18, pady=12)
+        self.status_var = tk.StringVar(value="◉  Idle")
+        self.status_lbl = tk.Label(header, textvariable=self.status_var,
+                                   bg=BG, fg="#4ade80",
+                                   font=("Segoe UI", 11, "bold"))
+        self.status_lbl.pack(side=tk.RIGHT, padx=18)
         
         # Set app icon if available
         try:
@@ -132,6 +210,7 @@ class DiceAutoBotApp:
         self.job_thread = None
         self.running = False
         self.is_paused = False
+        self.skip_requested = False
         
         # Load configuration if exists
         self.next_id = 1
@@ -139,36 +218,56 @@ class DiceAutoBotApp:
         # Initialize AI components early
         from core.learning_engine import LearningEngine
         self.learning_engine = LearningEngine()
-        self.semantic_matcher = None # Delayed init until config is loaded
+        self.semantic_matcher = None  # Delayed init until config is loaded
+        self.groq_scorer      = None  # Groq scorer — init alongside semantic matcher
         self.ai_loading = False
         
         self.load_config()
-        
+
+        # Transparent-mode state (initialise before any tab touches the root)
+        self.transparent_var    = tk.BooleanVar(value=False)
+        self.transparency_level = tk.DoubleVar(value=0.85)
+
         # Create the tabs
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
-        
+        main_area = ttk.Frame(self.root, padding=(10, 8))
+        main_area.pack(fill="both", expand=True)
+
+        self.notebook = ttk.Notebook(main_area)
+        self.notebook.pack(fill="both", expand=True)
+
         # Create tab frames
-        self.main_tab = ttk.Frame(self.notebook)
-        self.resumes_tab = ttk.Frame(self.notebook)
-        self.settings_tab = ttk.Frame(self.notebook)
-        self.ai_trainer_tab = ttk.Frame(self.notebook)
-        self.logs_tab = ttk.Frame(self.notebook)
-        
+        self.main_tab        = ttk.Frame(self.notebook, padding=10)
+        self.resumes_tab     = ttk.Frame(self.notebook, padding=10)
+        self.settings_tab    = ttk.Frame(self.notebook, padding=10)
+        self.ai_trainer_tab  = ttk.Frame(self.notebook, padding=10)
+        self.groq_scanner_tab= ttk.Frame(self.notebook, padding=10)
+        self.skill_gap_tab   = ttk.Frame(self.notebook, padding=10)
+
+        self.logs_tab        = ttk.Frame(self.notebook, padding=10)
+
         # Add tabs to notebook
-        self.notebook.add(self.main_tab, text="Run Bot")
-        self.notebook.add(self.resumes_tab, text="Resumes")
-        self.notebook.add(self.settings_tab, text="Settings")
+        self.notebook.add(self.main_tab,       text="Apply")
+        self.notebook.add(self.resumes_tab,    text="Résumés")
+        self.notebook.add(self.settings_tab,   text="Settings")
         self.notebook.add(self.ai_trainer_tab, text="AI Training")
-        self.notebook.add(self.logs_tab, text="Logs")
-        
+        self.notebook.add(self.groq_scanner_tab, text="AI & Keys")
+        self.notebook.add(self.skill_gap_tab,  text="Keyword Suggestions")
+
+        self.notebook.add(self.logs_tab,       text="Logs")
+
         # Set up UI for each tab
         self.setup_main_tab()
         self.setup_resumes_tab()
         self.setup_settings_tab()
         self.setup_ai_trainer_tab()
+        self.setup_groq_scanner_tab()
+        self.setup_skill_gap_tab()
+
         self.setup_logs_tab()
-        
+
+        from utils.desktop_theme import install_theme
+        install_theme(self.root, 'dice')
+
         # Log that app is started
         self.logger.info("Application started")
         
@@ -211,12 +310,30 @@ class DiceAutoBotApp:
         "Natural Language Processing","analyst","scientist","senior","cloud", 
         "aws","gcp","Azure","agentic","python","rag","llm"]
         self.headless_mode = False
+        self.keep_screen_awake = True
+        self.batch_excel_saves = True
         self.job_limit = 1500
         self.resume_profiles = []
         self.editing_idx = None  # Track index of profile being edited
         self.profile_name_boost_mode = 'off'  # Default: disabled until user enables per-profile
-        self.semantic_enabled = True # New feature enabled by default
-        
+        self.semantic_enabled = False  # Default to keyword-only on an 8 GB desktop.
+        self.filter_employment_type = "ALL"
+        self.filter_posted_date = "THREE"
+        self.filter_work_setting = "ALL"
+        self.filter_easy_apply   = False
+        self.filter_location     = ""
+        self.filter_radius       = "30"
+        self.filter_will_sponsor = False
+        self.filter_salary_min   = ""
+        self.auto_scan_enabled = False
+        self.last_auto_scan_timestamp = ""
+        self.key_rotation_mode = "random"
+        self.auto_attach_missed_kws = False
+        self.application_answers = {}
+        self.auto_answer_questions = False
+        self.allow_ai_generated_application_answers = False
+        self.minimum_ats_fit = 25.0
+
         # Try to load from file if it exists
         import json
         if os.path.exists(self.config_file):
@@ -227,6 +344,7 @@ class DiceAutoBotApp:
                     self.exclude_keywords = config.get('exclude_keywords', self.exclude_keywords)
                     self.include_keywords = config.get('include_keywords', self.include_keywords)
                     self.headless_mode = config.get('headless_mode', self.headless_mode)
+                    self.keep_screen_awake = config.get('keep_screen_awake', self.keep_screen_awake)
                     self.job_limit = config.get('job_application_limit', self.job_limit)
                     self.resume_profiles = config.get('resume_profiles', self.resume_profiles)
                     # Assign unique IDs to profiles for reliable GUI management
@@ -237,32 +355,111 @@ class DiceAutoBotApp:
                     
                     self.profile_name_boost_mode = config.get('profile_name_boost_mode', 'high')
                     self.semantic_enabled = config.get('semantic_enabled', True)
+                    self.filter_employment_type = config.get('filter_employment_type', 'ALL')
+                    self.filter_posted_date = config.get('filter_posted_date', 'THREE')
+                    self.filter_work_setting = config.get('filter_work_setting', 'ALL')
+                    self.filter_easy_apply = config.get('filter_easy_apply', False)
+                    self.filter_location = config.get('filter_location', '')
+                    self.filter_radius = config.get('filter_radius', '30')
+                    self.filter_will_sponsor = config.get('filter_will_sponsor', False)
+                    self.filter_salary_min = config.get('filter_salary_min', '')
+                    self.auto_scan_enabled = config.get('auto_scan_enabled', False)
+                    self.last_auto_scan_timestamp = config.get('last_auto_scan_timestamp', '')
+                    self.key_rotation_mode = config.get('key_rotation_mode', 'random')
+                    self.auto_attach_missed_kws = False  # Legacy option is ignored.
+                    self.application_answers = config.get('application_answers', {})
+                    self.auto_answer_questions = bool(config.get('auto_answer_questions', False))
+                    self.review_before_submit = bool(config.get('review_before_submit', False))
+                    self.allow_ai_generated_application_answers = bool(
+                        config.get('allow_ai_generated_application_answers', False)
+                    )
+                    try:
+                        self.minimum_ats_fit = min(100.0, max(0.0, float(config.get('minimum_ats_fit', 25.0))))
+                    except (TypeError, ValueError):
+                        self.minimum_ats_fit = 25.0
+
+                    # ── Universal API Key Manager ───────────────────────────────
+                    # Load new list-based keys. Migrate old groq_api_key if needed.
+                    self.api_keys_list = config.get('api_keys_list', [])
+                    old_groq_key = config.get('groq_api_key', '').strip()
+                    if not self.api_keys_list and old_groq_key:
+                        # Migrate old comma-separated key(s) to new format
+                        for i, k in enumerate([k.strip() for k in old_groq_key.split(',') if k.strip()]):
+                            self.api_keys_list.append({
+                                'provider': 'Groq',
+                                'name': f'Groq Key {i+1}',
+                                'key': k
+                            })
+                    
+                    window_geometry = config.get('window_geometry', '')
+                    if window_geometry:
+                        try:
+                            import re
+                            m = re.match(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$", window_geometry)
+                            if m:
+                                w, h = int(m.group(1)), int(m.group(2))
+                                x, y = int(m.group(3)), int(m.group(4))
+                                screen_w = self.root.winfo_screenwidth()
+                                screen_h = self.root.winfo_screenheight()
+
+                                # Clamp window size to fit current screen
+                                w = min(w, screen_w)
+                                h = min(h, screen_h)
+                                w = max(w, 860)
+                                h = max(h, 600)
+
+                                # If position would push the window off-screen, re-centre it
+                                if (x < -w // 2 or x > screen_w - 40 or
+                                        y < -20 or y > screen_h - 40):
+                                    x = max(0, (screen_w - w) // 2)
+                                    y = max(0, (screen_h - h) // 2)
+
+                                self.root.geometry(f"{w}x{h}+{x}+{y}")
+                            else:
+                                # Geometry string has no position — just apply the size
+                                self.root.geometry(window_geometry)
+                        except Exception:
+                            pass  # Keep the adaptive default set in __init__
                     
                     # Initialize Semantic Matcher in BACKGROUND if enabled
                     if self.semantic_enabled and self.resume_profiles:
                         self.ai_loading = True
-                        threading.Thread(target=self._init_ai_async, daemon=True).start()
+                        if hasattr(self, 'root'):
+                            self.root.after(100, lambda: threading.Thread(target=self._init_ai_async, daemon=True).start())
+                        else:
+                            threading.Thread(target=self._init_ai_async, daemon=True).start()
                     
                     self.logger.info("Configuration loaded successfully")
             except Exception as e:
                 self.logger.error(f"Error loading configuration: {e}")
         
     def _init_ai_async(self):
-        """Initializes the AI Semantic Matcher in the background to avoid GUI freeze"""
+        """Initializes the AI Semantic Matcher and Groq Scorer in the background to avoid GUI freeze"""
         try:
             self.root.after(0, lambda: self.update_status("[AI] Matcher is initializing in background..."))
-            
-            # This triggers the 80MB download if not present.
-            # We already imported SemanticResumeMatcher at the top level to avoid thread-init issues.
+
+            # ── Local sentence-transformer model (~80MB, CPU-only) ────────────
             matcher = SemanticResumeMatcher(self.resume_profiles)
-            
+
+            # ── Groq scorer uses the same configured key as Nvoids ──────
+            groq_scorer = None
+            try:
+                from core.groq_config import get_groq_key
+                _gkey = get_groq_key(self.config_dir)
+                if _gkey:
+                    rot_mode = getattr(self, 'key_rotation_mode', 'random')
+                    groq_scorer = GroqResumeScorer(api_key=_gkey, log_callback=self.logger.info, key_mode=rot_mode)
+                    self.logger.info("[LLMScorer] Groq scorer initialized with the shared key.")
+                else:
+                    self.logger.info("[LLMScorer] ℹ️ No LLM API keys found — keyword/semantic matcher active.")
+            except Exception as _ge:
+                self.logger.warning(f"[LLMScorer] ⚠️ Could not init scorer: {_ge}")
+
             def _on_complete():
                 self.semantic_matcher = matcher
+                self.groq_scorer      = groq_scorer
                 self.ai_loading = False
-                # Log directly — avoids nesting another root.after() inside an
-                # already-scheduled callback, which causes 'main thread is not
-                # in main loop' on some Python/Tk builds.
-                msg = "[AI] Semantic Matcher initialized and ready."
+                msg = "[AI] Semantic Matcher + Groq Scorer ready."
                 self.logger.info(msg)
                 try:
                     self.status_label.config(text=msg)
@@ -272,15 +469,17 @@ class DiceAutoBotApp:
                     self.refresh_ai_stats()
                 except Exception:
                     pass
-            
+                
+                # Check for auto scan
+                if getattr(self, 'auto_scan_enabled', False):
+                    self.root.after(3000, self._run_auto_scan_if_needed)
+
             self.root.after(0, _on_complete)
-            
+
         except Exception as e:
             err_str = str(e)
             def _on_error(err_msg=err_str):
                 self.ai_loading = False
-                # Strip emoji from the console-bound log message to guarantee
-                # encoding safety, then update the Tkinter label directly.
                 safe_msg = f"Background AI Init failed: {err_msg}"
                 self.logger.error(safe_msg)
                 try:
@@ -288,7 +487,7 @@ class DiceAutoBotApp:
                     self.status_label.config(text=f"AI Matcher failed to load: {short}...")
                 except Exception:
                     pass
-            
+
             self.root.after(0, _on_error)
 
     def _persist_config(self):
@@ -311,12 +510,26 @@ class DiceAutoBotApp:
                     pass
             return getattr(self, attr, default)
 
+        keys_list = getattr(self, 'api_keys_list', [])
+        if not getattr(self, '_groq_key_dirty', False):
+            # Another open bot may have updated the shared key since Dice loaded.
+            # Ordinary Dice settings saves must preserve that newer value.
+            from core.groq_config import get_groq_key
+            current_key = get_groq_key(self.config_dir, legacy=False)
+            keys_list = [entry for entry in keys_list
+                         if str(entry.get('provider', '')).lower() != 'groq']
+            if current_key:
+                keys_list.append({'provider': 'Groq', 'name': 'Shared Groq Key', 'key': current_key})
+            self.api_keys_list = keys_list
+        groq_keys = [item.get('key', '').strip() for item in keys_list if item.get('provider', '').lower() == 'groq' and item.get('key', '').strip()]
         profiles = getattr(self, 'resume_profiles', [])
+
         config = {
-            'search_queries':    [q.strip() for q in _safe_get('search_queries', 'search_query_entry', '') .replace('', '').split(',') if q.strip()] if isinstance(_safe_get('search_queries', 'search_query_entry', ''), str) else getattr(self, 'search_queries', []),
+            'search_queries':    [q.strip() for q in _safe_get('search_queries', 'search_query_entry', '').split(',') if q.strip()] if isinstance(_safe_get('search_queries', 'search_query_entry', ''), str) else getattr(self, 'search_queries', []),
             'exclude_keywords':  [k.strip() for k in _safe_get('exclude_keywords', 'exclude_keywords_entry', '').split(',') if k.strip()] if isinstance(_safe_get('exclude_keywords', 'exclude_keywords_entry', ''), str) else getattr(self, 'exclude_keywords', []),
             'include_keywords':  [k.strip() for k in _safe_get('include_keywords', 'include_keywords_entry', '').split(',') if k.strip()] if isinstance(_safe_get('include_keywords', 'include_keywords_entry', ''), str) else getattr(self, 'include_keywords', []),
             'headless_mode':     _safe_get('headless_mode', 'headless_var', False),
+            'batch_excel_saves': _safe_get('batch_excel_saves', 'batch_save_var', True),
             'job_application_limit': _safe_get('job_limit', 'job_limit_var', 1500),
             'resume_profiles':   profiles,
             'profile_name_boost_mode': (
@@ -324,11 +537,37 @@ class DiceAutoBotApp:
                 self.name_boost_var.get().split('|')[0].strip().lower()
             ) or getattr(self, 'profile_name_boost_mode', 'off'),
             'semantic_enabled': _safe_get('semantic_enabled', 'semantic_var', True),
+            'filter_employment_type': _safe_get('filter_employment_type', 'emp_type_var', 'ALL'),
+            'filter_posted_date': _safe_get('filter_posted_date', 'posted_date_var', 'THREE'),
+            'filter_work_setting': _safe_get('filter_work_setting', 'work_setting_var', 'ALL'),
+            'filter_easy_apply': _safe_get('filter_easy_apply', 'easy_apply_var', False),
+            'filter_location': _safe_get('filter_location', 'location_entry', ''),
+            'filter_radius': _safe_get('filter_radius', 'radius_var', '30'),
+            'filter_will_sponsor': _safe_get('filter_will_sponsor', 'will_sponsor_var', False),
+            'filter_salary_min': _safe_get('filter_salary_min', 'salary_min_entry', ''),
+            'window_geometry': self.root.geometry(),
+            'auto_scan_enabled': _safe_get('auto_scan_enabled', 'auto_scan_var', False),
+            'last_auto_scan_timestamp': getattr(self, 'last_auto_scan_timestamp', ''),
+            'key_rotation_mode': getattr(self, 'key_rotation_mode', 'random'),
+            'auto_attach_missed_kws': False,
+            'api_keys_list': keys_list,
+            'application_answers': getattr(self, 'application_answers', {}),
+            'auto_answer_questions': _safe_get('auto_answer_questions', 'auto_answer_var', False),
+            'review_before_submit': _safe_get('review_before_submit', 'review_before_submit_var', False),
+            'allow_ai_generated_application_answers': _safe_get(
+                'allow_ai_generated_application_answers', 'allow_ai_answers_var', False
+            ),
+            'minimum_ats_fit': _safe_get('minimum_ats_fit', 'minimum_ats_var', 25.0),
         }
-        
+
         try:
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=4)
+            from utils.config_manager import ConfigManager, invalidate_config_cache
+            manager = ConfigManager(self.config_dir)
+            manager.config = config
+            if not manager.save_config():
+                raise OSError("ConfigManager could not save settings.json")
+            self._groq_key_dirty = False
+            invalidate_config_cache()
             self.logger.info(f"Configuration persisted to disk. Profiles count: {len(profiles)}")
         except Exception as e:
             self.logger.error(f"Failed to persist configuration: {e}")
@@ -340,19 +579,54 @@ class DiceAutoBotApp:
 
         import json
         try:
+            keys_list = getattr(self, 'api_keys_list', [])
+            if not getattr(self, '_groq_key_dirty', False):
+                from core.groq_config import get_groq_key
+                current_key = get_groq_key(self.config_dir, legacy=False)
+                keys_list = [entry for entry in keys_list
+                             if str(entry.get('provider', '')).lower() != 'groq']
+                if current_key:
+                    keys_list.append({'provider': 'Groq', 'name': 'Shared Groq Key', 'key': current_key})
+                self.api_keys_list = keys_list
             # Read from all widgets (only call this when all tabs are initialised)
             config = {
                 'search_queries':    [q.strip() for q in self.search_query_entry.get().split(',') if q.strip()],
                 'exclude_keywords':  [k.strip() for k in self.exclude_keywords_entry.get().split(',') if k.strip()],
                 'include_keywords':  [k.strip() for k in self.include_keywords_entry.get().split(',') if k.strip()],
                 'headless_mode':     self.headless_var.get(),
+                'keep_screen_awake': getattr(self, 'keep_awake_var', tk.BooleanVar(value=True)).get() if hasattr(self, 'keep_awake_var') else getattr(self, 'keep_screen_awake', True),
+                'batch_excel_saves': getattr(self, 'batch_save_var', tk.BooleanVar(value=True)).get() if hasattr(self, 'batch_save_var') else getattr(self, 'batch_excel_saves', True),
                 'job_application_limit': self.job_limit_var.get(),
                 'resume_profiles':   self.resume_profiles,
                 'profile_name_boost_mode': self.name_boost_var.get().split('|')[0].strip().lower(),
                 'semantic_enabled': self.semantic_var.get(),
+                'filter_employment_type': getattr(self, 'emp_type_var', tk.StringVar(value='ALL')).get(),
+                'filter_posted_date': getattr(self, 'posted_date_var', tk.StringVar(value='THREE')).get(),
+                'filter_work_setting': getattr(self, 'work_setting_var', tk.StringVar(value='ALL')).get(),
+                'filter_easy_apply': getattr(self, 'easy_apply_var', tk.BooleanVar(value=False)).get(),
+                'filter_location': getattr(self, 'location_entry', None) and self.location_entry.get() or getattr(self, 'filter_location', ''),
+                'filter_radius': getattr(self, 'radius_var', tk.StringVar(value='30')).get(),
+                'filter_will_sponsor': getattr(self, 'will_sponsor_var', tk.BooleanVar(value=False)).get(),
+                'filter_salary_min': getattr(self, 'salary_min_entry', None) and self.salary_min_entry.get() or getattr(self, 'filter_salary_min', ''),
+                'window_geometry': self.root.geometry(),
+                'auto_scan_enabled': getattr(self, 'auto_scan_var', tk.BooleanVar(value=False)).get(),
+                'last_auto_scan_timestamp': getattr(self, 'last_auto_scan_timestamp', ''),
+                'key_rotation_mode': getattr(self, 'key_rotation_mode', 'random'),
+                'auto_attach_missed_kws': False,
+                'api_keys_list': keys_list,
+                'application_answers': getattr(self, 'application_answers', {}),
+                'auto_answer_questions': getattr(self, 'auto_answer_var', None).get() if hasattr(self, 'auto_answer_var') else getattr(self, 'auto_answer_questions', False),
+                'review_before_submit': getattr(self, 'review_before_submit_var', None).get() if hasattr(self, 'review_before_submit_var') else getattr(self, 'review_before_submit', False),
+                'allow_ai_generated_application_answers': getattr(self, 'allow_ai_answers_var', None).get() if hasattr(self, 'allow_ai_answers_var') else getattr(self, 'allow_ai_generated_application_answers', False),
+                'minimum_ats_fit': getattr(self, 'minimum_ats_var', None).get() if hasattr(self, 'minimum_ats_var') else getattr(self, 'minimum_ats_fit', 25.0),
             }
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=4)
+            from utils.config_manager import ConfigManager, invalidate_config_cache
+            manager = ConfigManager(self.config_dir)
+            manager.config = config
+            if not manager.save_config():
+                raise OSError("ConfigManager could not save settings.json")
+            self._groq_key_dirty = False
+            invalidate_config_cache()
 
             # Persist .env credentials
             username = self.username_entry.get()
@@ -374,9 +648,6 @@ class DiceAutoBotApp:
                 self.logger.error(f"Fallback persist also failed: {e2}")
                 if not silent:
                     messagebox.showerror("Error", f"Could not save settings: {str(e)}")
-
-            self.logger.error(f"Error saving configuration: {e}")
-            messagebox.showerror("Error", f"Could not save settings: {str(e)}")
         
     def calculate_time_estimate(self, jobs_count):
         """Calculate and display estimated completion time based on job count"""
@@ -408,10 +679,9 @@ class DiceAutoBotApp:
 
     def setup_main_tab(self):
         """Set up the main tab UI — compact, responsive layout."""
-        style = ttk.Style()
 
         # ── Inputs ───────────────────────────────────────────────────────────
-        input_frame = ttk.LabelFrame(self.main_tab, text="Search & Filter")
+        input_frame = ttk.LabelFrame(self.main_tab, text="🔍  Search & Filter")
         input_frame.pack(fill="x", padx=10, pady=(8, 4))
         input_frame.columnconfigure(1, weight=1)
         input_frame.columnconfigure(3, weight=1)
@@ -431,40 +701,78 @@ class DiceAutoBotApp:
         self.include_keywords_entry.grid(row=1, column=3, sticky="ew", padx=4, pady=4)
         self.include_keywords_entry.insert(0, ", ".join(self.include_keywords))
 
+        # ── Filters ──────────────────────────────────────────────────────────
+        filter_frame = ttk.Frame(input_frame)
+        filter_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 4))
+        
+        # Row 1: Existing filters
+        row1_frame = ttk.Frame(filter_frame)
+        row1_frame.pack(side="top", fill="x", pady=(0, 4))
+        
+        ttk.Label(row1_frame, text="Emp Type:").pack(side="left", padx=(8, 2))
+        self.emp_type_var = tk.StringVar(value=self.filter_employment_type)
+        ttk.Combobox(row1_frame, textvariable=self.emp_type_var, values=["ALL", "FULLTIME", "CONTRACTS", "PARTTIME", "THIRD_PARTY"], state="readonly", width=12).pack(side="left", padx=(0, 10))
+
+        ttk.Label(row1_frame, text="Date:").pack(side="left", padx=(0, 2))
+        self.posted_date_var = tk.StringVar(value=self.filter_posted_date)
+        ttk.Combobox(row1_frame, textvariable=self.posted_date_var, values=["ALL", "ONE", "THREE", "SEVEN", "FOURTEEN", "TWENTY_ONE"], state="readonly", width=12).pack(side="left", padx=(0, 10))
+
+        ttk.Label(row1_frame, text="Work:").pack(side="left", padx=(0, 2))
+        self.work_setting_var = tk.StringVar(value=self.filter_work_setting)
+        ttk.Combobox(row1_frame, textvariable=self.work_setting_var, values=["ALL", "REMOTE", "ONSITE", "HYBRID"], state="readonly", width=10).pack(side="left", padx=(0, 10))
+
+        # Row 2: New filters
+        row2_frame = ttk.Frame(filter_frame)
+        row2_frame.pack(side="top", fill="x", pady=(0, 2))
+
+        ttk.Label(row2_frame, text="Location:").pack(side="left", padx=(8, 2))
+        self.location_entry = ttk.Entry(row2_frame, width=15)
+        self.location_entry.pack(side="left", padx=(0, 10))
+        self.location_entry.insert(0, self.filter_location)
+
+        ttk.Label(row2_frame, text="Radius (miles):").pack(side="left", padx=(0, 2))
+        self.radius_var = tk.StringVar(value=self.filter_radius)
+        ttk.Combobox(row2_frame, textvariable=self.radius_var, values=["10", "20", "30", "50", "75", "100"], state="readonly", width=5).pack(side="left", padx=(0, 10))
+
+        ttk.Label(row2_frame, text="Min Salary:").pack(side="left", padx=(0, 2))
+        self.salary_min_entry = ttk.Entry(row2_frame, width=10)
+        self.salary_min_entry.pack(side="left", padx=(0, 10))
+        self.salary_min_entry.insert(0, self.filter_salary_min)
+
+        self.easy_apply_var = tk.BooleanVar(value=self.filter_easy_apply)
+        ttk.Checkbutton(row2_frame, text="Easy Apply Only", variable=self.easy_apply_var).pack(side="left", padx=(0, 10))
+
+        self.will_sponsor_var = tk.BooleanVar(value=self.filter_will_sponsor)
+        ttk.Checkbutton(row2_frame, text="Will Sponsor Visa", variable=self.will_sponsor_var).pack(side="left", padx=(0, 10))
+
         # ── Action buttons ───────────────────────────────────────────────────
         btn_frame = ttk.Frame(self.main_tab)
         btn_frame.pack(fill="x", padx=10, pady=4)
-        btn_frame.columnconfigure(0, weight=3)
-        btn_frame.columnconfigure(1, weight=1)
-
-        style.configure("Start.TButton",
-            background="#28a745", foreground="white",
-            font=("Segoe UI", 12, "bold"), padding=(10, 6)
-        )
-        style.map("Start.TButton", background=[("active", "#218838"), ("disabled", "#94d3a2")])
-        style.configure("Stop.TButton",
-            background="#dc3545", foreground="white",
-            font=("Segoe UI", 10, "bold"), padding=(6, 6)
-        )
-        style.map("Stop.TButton", background=[("active", "#c82333"), ("disabled", "#e8a0a7")])
+        for col in range(4):
+            btn_frame.columnconfigure(col, weight=1)
 
         self.start_button = ttk.Button(
             btn_frame, text="▶  Start Applying", command=self.start_applying, style="Start.TButton"
         )
-        self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=2)
+        self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
+
+        self.pause_button = ttk.Button(
+            btn_frame, text="⏸  Pause", command=self.toggle_pause, state="disabled", style="Amber.TButton"
+        )
+        self.pause_button.grid(row=0, column=1, sticky="ew", padx=4, pady=2)
 
         self.stop_button = ttk.Button(
-            btn_frame, text="■  Stop", command=self.stop_applying, style="Stop.TButton", state="disabled"
+            btn_frame, text="⏹  Stop", command=self.stop_applying, style="Stop.TButton", state="disabled"
         )
-        self.stop_button.grid(row=0, column=2, sticky="ew", pady=2)
-        
-        self.pause_button = ttk.Button(
-            btn_frame, text="⏸  Pause", command=self.toggle_pause, state="disabled"
+        self.stop_button.grid(row=0, column=2, sticky="ew", padx=4, pady=2)
+
+        self.skip_button = ttk.Button(
+            btn_frame, text="⏭  Skip Job", command=self.skip_job, style="Skip.TButton", state="disabled"
         )
-        self.pause_button.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
+        self.skip_button.grid(row=0, column=3, sticky="ew", padx=(4, 0), pady=2)
 
         # ── Progress ─────────────────────────────────────────────────────────
-        progress_frame = ttk.LabelFrame(self.main_tab, text="Progress")
+        progress_frame = ttk.LabelFrame(self.main_tab, text="⚡  Progress")
         progress_frame.pack(fill="x", padx=10, pady=4)
 
         self.status_label = ttk.Label(progress_frame, text="Ready to start.", font=("Segoe UI", 9))
@@ -473,37 +781,109 @@ class DiceAutoBotApp:
         self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate")
         self.progress_bar.pack(fill="x", padx=8, pady=(2, 4))
 
-        # ── Stats row (colored badge-style labels) ────────────────────────────
+        # ── Stats row (dark card style) ───────────────────────────────────────
+        t = self._theme
+        BORDER = t["BORDER"]
         stats_frame = ttk.Frame(self.main_tab)
-        stats_frame.pack(fill="x", padx=10, pady=2)
+        stats_frame.pack(fill="x", padx=10, pady=(4, 6))
         for col in range(4):
             stats_frame.columnconfigure(col, weight=1)
 
-        def _stat_badge(parent, col, label_text, initial="0", bg="#e9ecef", fg="#212529"):
-            f = tk.Frame(parent, bg=bg, bd=0, highlightthickness=1, highlightbackground="#ced4da")
-            f.grid(row=0, column=col, sticky="ew", padx=4, pady=2)
-            tk.Label(f, text=label_text, bg=bg, fg="#555", font=("Segoe UI", 8)).pack(pady=(4,0))
-            val = tk.Label(f, text=initial, bg=bg, fg=fg, font=("Segoe UI", 16, "bold"))
-            val.pack(pady=(0,4))
-            return val
+        def _dark_card(col, title, init="0", bg="#1a3a5c", fg="#60a5fa", fg2="#93c5fd"):
+            f = tk.Frame(stats_frame, bg=bg, bd=0, highlightthickness=1, highlightbackground=BORDER)
+            f.grid(row=0, column=col, sticky="ew", padx=5, pady=2)
+            tk.Label(f, text=title, bg=bg, fg=fg2, font=("Segoe UI", 8, "bold")).pack(pady=(8, 0))
+            lbl = tk.Label(f, text=init, bg=bg, fg=fg, font=("Segoe UI", 20, "bold"))
+            lbl.pack(pady=(2, 8))
+            return lbl
 
-        self.jobs_found_label   = _stat_badge(stats_frame, 0, "Total Jobs",    bg="#e8f4fd", fg="#0d6efd")
-        self.jobs_applied_label = _stat_badge(stats_frame, 1, "Applied",       bg="#d4edda", fg="#155724")
-        self.jobs_failed_label  = _stat_badge(stats_frame, 2, "Failed",        bg="#f8d7da", fg="#721c24")
-        self.estimated_time_label = _stat_badge(stats_frame, 3, "Est. Time", initial="--", bg="#fff3cd", fg="#856404")
+        self.jobs_found_label     = _dark_card(0, "TOTAL JOBS",  bg=t["CARD_B"], fg="#60a5fa",  fg2="#93c5fd")
+        self.jobs_applied_label   = _dark_card(1, "APPLIED",     bg=t["CARD_G"], fg="#4ade80",  fg2="#86efac")
+        self.jobs_failed_label    = _dark_card(2, "FAILED",      bg=t["CARD_R"], fg="#f87171",  fg2="#fca5a5")
+        self.estimated_time_label = _dark_card(3, "EST. TIME",   bg=t["CARD_Y"], fg="#fbbf24",  fg2="#fcd34d", init="--")
 
-        # ── Excel quick-open buttons ──────────────────────────────────────────
-        excel_frame = ttk.LabelFrame(self.main_tab, text="Quick Open")
-        excel_frame.pack(fill="x", padx=10, pady=4)
-        ef = ttk.Frame(excel_frame)
-        ef.pack(fill="x", padx=5, pady=4)
-        ttk.Button(ef, text="✔ Applied Jobs",     command=lambda: self.open_excel_file("applied_jobs.xlsx")).pack(side="left", padx=5)
-        ttk.Button(ef, text="✘ Not Applied",      command=lambda: self.open_excel_file("not_applied_jobs.xlsx")).pack(side="left", padx=5)
-        ttk.Button(ef, text="⊘ Excluded Jobs",    command=lambda: self.open_excel_file("excluded_jobs.xlsx")).pack(side="left", padx=5)
+        stats_frame.columnconfigure(4, weight=1)
+        self.jobs_skipped_label = _dark_card(4, "SKIPPED", bg=t["CARD_Y"], fg="#fbbf24", fg2="#fcd34d")
+
+        # ── Data Management & Transparency controls ───────────────────────────
+        ctrl_frame = ttk.LabelFrame(self.main_tab, text="🗂  Quick Open & UI Controls")
+        ctrl_frame.pack(fill="x", padx=10, pady=(0, 6))
+        
+        row2 = ttk.Frame(ctrl_frame)
+        row2.pack(fill="x", pady=2, padx=4)
+        self.continuous_var = tk.BooleanVar(value=getattr(self, 'continuous_mode', False))
+        ck_continuous = LabeledToggleSwitch(
+            row2,
+            text="Continuous Mode",
+            variable=self.continuous_var,
+            bg=self._theme["PANEL"], fg=self._theme["FG"]
+        )
+        ck_continuous.pack(side="left", padx=4)
+
+        ctrl_top = ttk.Frame(ctrl_frame)
+        ctrl_top.pack(fill="x", pady=(4, 2), padx=4)
+
+        ttk.Button(ctrl_top, text="✔  Applied Jobs",
+                   command=lambda: self.open_excel_file("applied_jobs.xlsx"),
+                   style="Blue.TButton").pack(side="left", padx=4)
+        ttk.Button(ctrl_top, text="✘  Not Applied",
+                   command=lambda: self.open_excel_file("not_applied_jobs.xlsx"),
+                   style="Amber.TButton").pack(side="left", padx=4)
+        ttk.Button(ctrl_top, text="⊘  Excluded Jobs",
+                   command=lambda: self.open_excel_file("excluded_jobs.xlsx"),
+                   style="Stop.TButton").pack(side="left", padx=4)
+
+        ctrl_bot = ttk.Frame(ctrl_frame)
+        ctrl_bot.pack(fill="x", pady=(2, 6), padx=4)
+
+        PANEL = t["PANEL"]
+        FG    = t["FG"]
+        ck_trans = LabeledToggleSwitch(
+            ctrl_bot, text="👁  Transparent Mode (Stay on Top)",
+            variable=self.transparent_var,
+            command=self._toggle_transparent,
+            bg=PANEL, fg=FG
+        )
+        ck_trans.pack(side="left", padx=(4, 10))
+
+        ttk.Label(ctrl_bot, text="Opacity:").pack(side="left", padx=(20, 5))
+        trans_scale = ttk.Scale(
+            ctrl_bot, from_=0.1, to_=1.0,
+            variable=self.transparency_level,
+            orient=tk.HORIZONTAL,
+            command=lambda _: self._toggle_transparent(),
+            length=150
+        )
+        trans_scale.pack(side="left", padx=(0, 5))
+
+        # ── Speed controls ───────────────────────────────────────────────────
+        ctrl_speed = ttk.Frame(ctrl_frame)
+        ctrl_speed.pack(fill="x", pady=(2, 6), padx=4)
+        
+        ttk.Label(ctrl_speed, text="🚀  Bot Speed:").pack(side="left", padx=(4, 10))
+        
+        self.speed_var = tk.DoubleVar(value=1.0)
+        
+        def set_speed(val):
+            self.speed_var.set(val)
+            try:
+                import core.main_script
+                import utils.timing
+                core.main_script.GLOBAL_SPEED_MULTIPLIER = val
+                utils.timing.set_speed_multiplier(val)
+                self.logger.info(f"⚡ Bot speed updated to {val}x")
+            except Exception as e:
+                print(f"Error setting speed: {e}")
+            
+        ttk.Radiobutton(ctrl_speed, text="0.5x (Relaxed)",  variable=self.speed_var, value=0.5, command=lambda: set_speed(0.5)).pack(side="left", padx=4)
+        ttk.Radiobutton(ctrl_speed, text="1.0x (Normal)",   variable=self.speed_var, value=1.0, command=lambda: set_speed(1.0)).pack(side="left", padx=4)
+        ttk.Radiobutton(ctrl_speed, text="1.5x (Moderate)", variable=self.speed_var, value=1.5, command=lambda: set_speed(1.5)).pack(side="left", padx=4)
+        ttk.Radiobutton(ctrl_speed, text="2.0x (Fast)",     variable=self.speed_var, value=2.0, command=lambda: set_speed(2.0)).pack(side="left", padx=4)
+        ttk.Radiobutton(ctrl_speed, text="3.0x (Turbo)",    variable=self.speed_var, value=3.0, command=lambda: set_speed(3.0)).pack(side="left", padx=4)
 
         # ── Live log ─────────────────────────────────────────────────────────
-        log_frame = ttk.LabelFrame(self.main_tab, text="Live Log")
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        log_frame = ttk.LabelFrame(self.main_tab, text="📋  Live Log")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         self.log_text = scrolledtext.ScrolledText(
             log_frame, height=8, wrap=tk.WORD, font=("Consolas", 8),
@@ -517,6 +897,15 @@ class DiceAutoBotApp:
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         self.log_handler.setFormatter(formatter)
         self.logger.addHandler(self.log_handler)
+
+    def _toggle_transparent(self, *_):
+        """Toggle always-on-top transparent mode and apply the opacity slider value."""
+        if self.transparent_var.get():
+            self.root.attributes("-topmost", True)
+            self.root.attributes("-alpha", self.transparency_level.get())
+        else:
+            self.root.attributes("-topmost", False)
+            self.root.attributes("-alpha", 1.0)
 
     def open_excel_file(self, filename):
         """Open an Excel file using the system default application"""
@@ -661,8 +1050,10 @@ class DiceAutoBotApp:
         # Row 3: File Path
         ttk.Label(form_frame, text="Resume File:").grid(row=3, column=0, sticky="w", padx=2, pady=2)
         self.resume_path_entry = ttk.Entry(form_frame)
-        self.resume_path_entry.grid(row=3, column=1, columnspan=3, sticky="ew", padx=2, pady=2)
-        ttk.Button(form_frame, text="📁 Browse", command=self.browse_resume_file).grid(row=3, column=4, padx=5, pady=2)
+        self.resume_path_entry.grid(row=3, column=1, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(form_frame, text="📁 Browse", command=self.browse_resume_file).grid(row=3, column=3, padx=5, pady=2)
+        self.auto_fill_btn = ttk.Button(form_frame, text="✨ Auto-Fill (AI)", command=self._start_auto_fill_profile)
+        self.auto_fill_btn.grid(row=3, column=4, padx=5, pady=2)
 
         # Actions
         action_outer = ttk.Frame(self.form_container)
@@ -673,6 +1064,7 @@ class DiceAutoBotApp:
         
         ttk.Button(action_outer, text="↺ Clear / New", command=self.clear_resume_form).pack(side="left", padx=5)
         ttk.Button(action_outer, text="🗑 Delete Selected", command=self.delete_resume_profile).pack(side="left", padx=5)
+        ttk.Button(action_outer, text="🔍 Audit & Validate Profiles", command=self.audit_resume_profiles, style="Blue.TButton").pack(side="left", padx=5)
         
         ttk.Button(action_outer, text="⚙ Test Matcher", command=self.open_test_simulator).pack(side="right", padx=5)
 
@@ -803,10 +1195,19 @@ class DiceAutoBotApp:
             self.resume_path_entry.insert(0, str(values[6]))
 
     def browse_resume_file(self):
+        import pathlib
         file_path = filedialog.askopenfilename(filetypes=[("PDF/Word Documents", "*.pdf *.docx *.doc")])
         if file_path:
-            # Normalize to OS-native separators (important for Windows path pasting)
-            normalized_path = os.path.normpath(file_path)
+            # Normalize to OS-native separators safely
+            normalized_path = str(pathlib.Path(file_path).resolve())
+            
+            # Check if this exact file path is already used in an existing profile
+            if hasattr(self, "resume_profiles"):
+                for p in self.resume_profiles:
+                    if p.get("file_path", "") == normalized_path:
+                        messagebox.showwarning("File Already Exists", f"This resume file is already used by the profile '{p.get('name')}'.\nPlease select a different resume.")
+                        return
+
             self.resume_path_entry.delete(0, tk.END)
             self.resume_path_entry.insert(0, normalized_path)
             # Scroll to the end of the entry so users can see the filename
@@ -878,6 +1279,121 @@ class DiceAutoBotApp:
         self.refresh_resume_list(self.resume_search_var.get() if hasattr(self, 'resume_search_var') else "")
         self.clear_resume_form()
 
+    def _get_dice_groq_key(self) -> str:
+        """Retrieve Groq API key configured for Dice Bot directly."""
+        from core.groq_config import get_groq_key
+        return get_groq_key(self.config_dir)
+
+    def _start_auto_fill_profile(self):
+        import os, threading, json
+        file_path = self.resume_path_entry.get().strip()
+        if not file_path or not os.path.exists(file_path):
+            messagebox.showwarning("File Not Found", "Please browse and select a valid resume file first.")
+            return
+        
+        gkey = self._get_dice_groq_key()
+
+        if not gkey:
+            messagebox.showwarning("Missing API Key", "Please add your Groq API key in the Groq Scanner tab (API Key Manager) first.")
+            return
+
+        self.add_update_btn.config(state=tk.DISABLED)
+        self.auto_fill_btn.config(state=tk.DISABLED, text="✨ Extracting.  ")
+        self.logger.info("Starting AI auto-fill... please wait.")
+        
+        # Start animation
+        self._auto_fill_animating = True
+        self._animate_auto_fill_btn(0)
+        
+        t = threading.Thread(target=self._auto_fill_worker, args=(gkey, file_path), daemon=True)
+        t.start()
+
+    def _animate_auto_fill_btn(self, frame_idx):
+        if getattr(self, "_auto_fill_animating", False):
+            frames = ["✨ Extracting.  ", "✨ Extracting.. ", "✨ Extracting..."]
+            self.auto_fill_btn.config(text=frames[frame_idx % len(frames)])
+            self.root.after(400, self._animate_auto_fill_btn, frame_idx + 1)
+
+    def _auto_fill_worker(self, gkey, file_path):
+        try:
+            from core.file_utils import extract_text_from_file
+            from core.groq_resume_scorer import GroqResumeScorer
+            
+            text = extract_text_from_file(file_path)
+            if not text:
+                self.root.after(0, lambda: messagebox.showwarning("Extraction Failed", "Could not extract text from the file."))
+                return
+
+            profile_data = GroqResumeScorer.auto_extract_profile(gkey, text, self.logger.error)
+            
+            if profile_data:
+                self.root.after(0, self._apply_auto_fill, profile_data)
+            else:
+                self.root.after(0, lambda: messagebox.showwarning("AI Failed", "Could not extract profile from the file using AI."))
+        except Exception as e:
+            self.logger.error(f"Auto-fill error: {e}")
+            self.root.after(0, lambda error=str(e): messagebox.showwarning("Error", f"Auto-fill error: {error}"))
+        finally:
+            self._auto_fill_animating = False
+            self.root.after(0, lambda: self.add_update_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.auto_fill_btn.config(state=tk.NORMAL, text="✨ Auto-Fill (AI)"))
+
+    def _apply_auto_fill(self, profile_data):
+        if profile_data.get("name"):
+            self.resume_name_entry.delete(0, tk.END)
+            self.resume_name_entry.insert(0, profile_data["name"])
+        
+        if profile_data.get("unique_keywords"):
+            self.resume_unique_keywords_entry.delete(0, tk.END)
+            self.resume_unique_keywords_entry.insert(0, ", ".join(profile_data["unique_keywords"]))
+            
+        if profile_data.get("keywords"):
+            self.resume_keywords_entry.delete(0, tk.END)
+            self.resume_keywords_entry.insert(0, ", ".join(profile_data["keywords"]))
+            
+        self.logger.info("AI Auto-fill complete! Please review and click 'Add New Profile'.")
+
+    def delete_profile_by_id(self, profile_id: int, profile_name: str = None) -> bool:
+        """Helper to delete a profile by ID or Name, cleaning up AI stats & persisted config."""
+        profiles = getattr(self, "resume_profiles", [])
+        target_idx = None
+        for idx, p in enumerate(profiles):
+            if p.get("id") == profile_id:
+                target_idx = idx
+                break
+            if profile_name and str(p.get("name", "")) == profile_name:
+                target_idx = idx
+                break
+        
+        if target_idx is not None:
+            deleted_profile = profiles.pop(target_idx)
+            p_name = deleted_profile.get('name', 'Unknown')
+            p_id = deleted_profile.get('id', profile_id)
+            self.logger.info(f"Deleted resume profile: {p_name} (ID: {p_id})")
+            
+            # Delete from AI Training data
+            try:
+                if hasattr(self, 'learning_engine') and self.learning_engine:
+                    self.learning_engine.delete_profile_history(p_id)
+            except Exception as e:
+                self.logger.error(f"Error removing AI training data: {e}")
+                
+            # Delete from Semantic Matcher
+            if getattr(self, 'semantic_enabled', False) and getattr(self, 'semantic_matcher', None):
+                try:
+                    self.semantic_matcher.delete_profile(p_id)
+                except Exception as e:
+                    self.logger.error(f"Error removing semantic profile: {e}")
+            
+            self._persist_config()
+            self.refresh_resume_list(self.resume_search_var.get() if hasattr(self, 'resume_search_var') else "")
+            self.clear_resume_form()
+            
+            if hasattr(self, 'refresh_ai_stats'):
+                self.refresh_ai_stats()
+            return True
+        return False
+
     def delete_resume_profile(self):
         selected = self.resume_tree.selection()
         if not selected:
@@ -894,136 +1410,612 @@ class DiceAutoBotApp:
             return
         
         if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete profile '{profile_name}'?"):
-            profiles = getattr(self, "resume_profiles", [])
-            target_idx = None
-            for idx, p in enumerate(profiles):
-                if p.get("id") == profile_id:
-                    target_idx = idx
-                    break
-                if str(p.get("name", "")) == profile_name:
-                    target_idx = idx
-                    break
-            
-            if target_idx is not None:
-                deleted_profile = profiles.pop(target_idx)
-                self.logger.info(f"Deleted resume profile: {deleted_profile.get('name', 'Unknown')}")
-                
-                # Delete from AI Training data
-                try:
-                    if hasattr(self, 'learning_engine') and self.learning_engine:
-                        self.learning_engine.delete_profile_history(profile_id)
-                except Exception as e:
-                    self.logger.error(f"Error removing AI training data: {e}")
-                    
-                # Delete from Semantic Matcher
-                if getattr(self, 'semantic_enabled', False) and getattr(self, 'semantic_matcher', None):
-                    try:
-                        self.semantic_matcher.delete_profile(profile_id)
-                    except Exception as e:
-                        self.logger.error(f"Error removing semantic profile: {e}")
-                
-                self._persist_config()
-                self.refresh_resume_list(self.resume_search_var.get())
-                self.clear_resume_form()
-                
-                if hasattr(self, 'refresh_ai_stats'):
-                    self.refresh_ai_stats()
+            if self.delete_profile_by_id(profile_id, profile_name):
+                messagebox.showinfo("Profile Deleted", f"Successfully deleted profile '{profile_name}'.")
             else:
                 self.logger.error(f"Delete failed: Profile '{profile_name}' not found in internal list.")
                 messagebox.showerror("Error", "Could not delete profile: it was not found in the master list.")
+
+    def _extract_location_from_resume_file(self, file_path: str) -> tuple:
+        """
+        Extract location strings from a resume file (.docx or .pdf).
+        Returns (detected_location_str, status_description)
+        """
+        if not file_path or not os.path.exists(file_path):
+            return None, "File Missing / Not Found"
+            
+        try:
+            from core.file_utils import extract_text_from_file
+            text = extract_text_from_file(file_path)
+            if not text or not text.strip():
+                return None, "Unreadable Text or Empty File"
+                
+            header_text = text[:2500]
+            us_states = r"(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)"
+            city_state_pattern = rf"\b([A-Z][a-zA-Z\s\.\-]{{2,25}}),\s*({us_states})\b(?:\s+(\d{{5}}(?:-\d{{4}})?))?"
+            import re
+            matches = re.findall(city_state_pattern, header_text)
+            
+            locations_found = []
+            skip_words = ["University", "College", "Institute", "School", "Company", "Inc", "LLC", "Corporation", 
+                          "January", "February", "March", "April", "May", "June", "July", "August", "September", 
+                          "October", "November", "December", "Software", "Platforms"]
+            for m in matches:
+                city = m[0].strip()
+                state = m[1].strip()
+                zip_code = m[2].strip() if len(m) > 2 and m[2] else ""
+                if not any(w.lower() in city.lower() for w in skip_words):
+                    loc_str = f"{city}, {state}"
+                    if zip_code:
+                        loc_str += f" {zip_code}"
+                    if loc_str not in locations_found:
+                        locations_found.append(loc_str)
+                        
+            if locations_found:
+                return locations_found[0], f"Found: {', '.join(locations_found)}"
+                
+            return None, "No location pattern detected in resume header"
+        except Exception as e:
+            return None, f"Error parsing resume text: {e}"
+
+    def audit_resume_profiles(self):
+        """Perform full diagnostic audit on all resume profiles (files, keywords, locations)."""
+        profiles = getattr(self, "resume_profiles", [])
+        if not profiles:
+            messagebox.showwarning("No Profiles", "There are no resume profiles to audit.")
+            return
+
+        search_loc = ""
+        if hasattr(self, 'location_entry') and self.location_entry:
+            search_loc = self.location_entry.get().strip()
+        elif hasattr(self, 'filter_location'):
+            search_loc = str(self.filter_location).strip()
+
+        audit_results = []
+        for p in profiles:
+            p_id = p.get('id', 'N/A')
+            name = p.get('name', 'Unnamed Profile')
+            file_path = p.get('file_path', '').strip()
+            
+            # 1. File Status Check
+            if not file_path:
+                file_status = "❌ Missing Path"
+                file_health = "error"
+            elif not os.path.exists(file_path):
+                file_status = "❌ File Not Found"
+                file_health = "error"
+            elif os.path.basename(file_path).startswith("~$"):
+                file_status = "⚠️ Lock/Temp File"
+                file_health = "error"
+            else:
+                file_status = "✅ Valid File"
+                file_health = "healthy"
+
+            # 2. Keywords Status Check
+            uni_kws = p.get('unique_keywords', [])
+            gen_kws = p.get('keywords', [])
+            if not uni_kws and not gen_kws:
+                kw_status = "❌ No Keywords Defined"
+                kw_health = "error"
+            elif not uni_kws:
+                kw_status = "⚠️ Missing Priority Skills"
+                kw_health = "warning"
+            elif not gen_kws:
+                kw_status = "⚠️ Missing General Skills"
+                kw_health = "warning"
+            else:
+                kw_status = f"✅ {len(uni_kws)} Priority, {len(gen_kws)} General"
+                kw_health = "healthy"
+
+            # 3. Location Status Check
+            det_loc, loc_msg = self._extract_location_from_resume_file(file_path)
+            if file_health == "error":
+                loc_status = "❌ Cannot Check (Broken File)"
+                loc_health = "error"
+            elif det_loc:
+                if search_loc and search_loc.lower() not in det_loc.lower() and det_loc.lower() not in search_loc.lower():
+                    loc_status = f"📍 {det_loc} (Differs from search: '{search_loc}')"
+                    loc_health = "warning"
+                else:
+                    loc_status = f"📍 {det_loc}"
+                    loc_health = "healthy"
+            else:
+                loc_status = "⚠️ Missing location in resume header"
+                loc_health = "warning"
+
+            # Overall Health Determination
+            if file_health == "error" or kw_health == "error":
+                overall = "error"
+            elif kw_health == "warning" or loc_health == "warning":
+                overall = "warning"
+            else:
+                overall = "healthy"
+
+            audit_results.append({
+                "id": p_id,
+                "name": name,
+                "file_path": file_path,
+                "file_status": file_status,
+                "kw_status": kw_status,
+                "loc_status": loc_status,
+                "overall": overall,
+                "detected_loc": det_loc,
+                "loc_msg": loc_msg
+            })
+
+        self.open_profile_audit_window(audit_results)
+
+    def open_profile_audit_window(self, audit_results):
+        """Open an interactive diagnostic window listing all profile issues and re-link options."""
+        win = tk.Toplevel(self.root)
+        win.title("🔍 Resume Profiles Health & Location Audit")
+        win.geometry("950x720")
+
+        t = getattr(self, "_theme", {})
+        BG     = t.get("BG", "#1e2130")
+        PANEL  = t.get("PANEL", "#252b3b")
+        BORDER = t.get("BORDER", "#3d4a6a")
+        win.configure(bg=BG)
+
+        # Header
+        hdr = tk.Frame(win, bg=BG)
+        hdr.pack(fill="x", padx=16, pady=(12, 6))
+        tk.Label(hdr, text="🔍 Resume Profiles Diagnostic Report", bg=BG, fg="#93c5fd", font=("Segoe UI", 14, "bold")).pack(side="left")
+
+        # Counts
+        total_cnt   = len(audit_results)
+        healthy_cnt = sum(1 for r in audit_results if r["overall"] == "healthy")
+        warn_cnt    = sum(1 for r in audit_results if r["overall"] == "warning")
+        error_cnt   = sum(1 for r in audit_results if r["overall"] == "error")
+
+        stats_row = tk.Frame(win, bg=BG)
+        stats_row.pack(fill="x", padx=16, pady=4)
+
+        def _card(parent, title, val, bg_c, fg_c):
+            f = tk.Frame(parent, bg=bg_c, bd=0, highlightthickness=1, highlightbackground=BORDER)
+            f.pack(side="left", padx=5, expand=True, fill="x")
+            tk.Label(f, text=title, bg=bg_c, fg=fg_c, font=("Segoe UI", 8, "bold")).pack(pady=(6, 0))
+            tk.Label(f, text=str(val), bg=bg_c, fg=fg_c, font=("Segoe UI", 16, "bold")).pack(pady=(0, 6))
+
+        _card(stats_row, "TOTAL PROFILES", total_cnt,   "#1a3a5c", "#60a5fa")
+        _card(stats_row, "HEALTHY",        healthy_cnt, "#1a3a2a", "#4ade80")
+        _card(stats_row, "WARNINGS",       warn_cnt,    "#3a2e10", "#fbbf24")
+        _card(stats_row, "ERRORS / BROKEN",error_cnt,   "#3a1a1a", "#f87171")
+
+        # Treeview table
+        tbl_container = ttk.LabelFrame(win, text="Profile Issues & Diagnostics")
+        tbl_container.pack(fill="both", expand=True, padx=16, pady=8)
+
+        tree_frame = ttk.Frame(tbl_container)
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+        cols = ("id", "name", "file_status", "loc_status", "kw_status", "path")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
+        tree.heading("id",          text="ID")
+        tree.heading("name",        text="Profile Name")
+        tree.heading("file_status", text="File Path Status")
+        tree.heading("loc_status",  text="Location Status")
+        tree.heading("kw_status",   text="Keywords Status")
+        tree.heading("path",        text="Local Path")
+
+        tree.column("id",          width=40,  anchor="center")
+        tree.column("name",        width=170, anchor="w")
+        tree.column("file_status", width=130, anchor="w")
+        tree.column("loc_status",  width=220, anchor="w")
+        tree.column("kw_status",   width=170, anchor="w")
+        tree.column("path",        width=200, anchor="w")
+
+        tree.tag_configure("healthy", background="#1a3a2a", foreground="#86efac")
+        tree.tag_configure("warning", background="#3a2e10", foreground="#fde047")
+        tree.tag_configure("error",   background="#3a1a1a", foreground="#fca5a5")
+
+        sb_y = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        sb_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+
+        tree.pack(side="left", fill="both", expand=True)
+        sb_y.pack(side="right", fill="y")
+
+        for item in audit_results:
+            tree.insert("", "end", tags=(item["overall"],), values=(
+                str(item["id"]),
+                item["name"],
+                item["file_status"],
+                item["loc_status"],
+                item["kw_status"],
+                item["file_path"]
+            ))
+
+        # Bottom buttons
+        btn_bar = ttk.Frame(win)
+        btn_bar.pack(fill="x", padx=16, pady=(4, 12))
+
+        def _relink_selected():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select a profile from the table to re-link.")
+                return
+            vals = tree.item(sel[0])["values"]
+            p_id = int(vals[0])
+            p_name = str(vals[1])
+            
+            new_file = filedialog.askopenfilename(
+                title=f"Select Resume File for '{p_name}'",
+                filetypes=[("Word / PDF Documents", "*.docx *.pdf *.doc")]
+            )
+            if new_file:
+                import pathlib
+                norm_path = str(pathlib.Path(new_file).resolve())
+                for p in self.resume_profiles:
+                    if p.get("id") == p_id or p.get("name") == p_name:
+                        p["file_path"] = norm_path
+                        break
+                self._persist_config()
+                self.refresh_resume_list()
+                win.destroy()
+                self.audit_resume_profiles()
+                messagebox.showinfo("File Re-linked", f"Successfully updated file path for '{p_name}'.")
+
+        def _delete_selected_from_audit():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please select a profile from the audit list to delete.")
+                return
+            vals = tree.item(sel[0])["values"]
+            p_id = int(vals[0])
+            p_name = str(vals[1])
+
+            if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete profile '{p_name}' (ID: {p_id})?"):
+                if self.delete_profile_by_id(p_id, p_name):
+                    win.destroy()
+                    self.audit_resume_profiles()
+                    messagebox.showinfo("Profile Deleted", f"Successfully deleted profile '{p_name}'.")
+                else:
+                    messagebox.showerror("Error", f"Could not find profile '{p_name}' in master list.")
+
+        ttk.Button(btn_bar, text="📁 Re-link Selected Resume File", command=_relink_selected, style="Start.TButton").pack(side="left", padx=(0, 8))
+        ttk.Button(btn_bar, text="🗑 Delete Selected Profile", command=_delete_selected_from_audit, style="Stop.TButton").pack(side="left", padx=8)
+        ttk.Button(btn_bar, text="🔄 Refresh Audit", command=lambda: [win.destroy(), self.audit_resume_profiles()]).pack(side="left", padx=8)
+        ttk.Button(btn_bar, text="Close Window", command=win.destroy).pack(side="right")
+
+        tree.bind("<Delete>", lambda e: _delete_selected_from_audit())
 
     def open_test_simulator(self):
         """Open a window to test which profile matches a given job description text based on configured keywords."""
         test_window = tk.Toplevel(self.root)
         test_window.title("Test Profile Matching Simulator")
-        test_window.geometry("600x600")
-        
-        # Add instructional label
-        ttk.Label(test_window, text="Paste a sample job description below to completely simulate which profile uniquely matches:").pack(padx=10, pady=10, anchor="w")
+        test_window.geometry("780x700")
 
-        # Display the result - MUST PACK IT TOP LEVEL SO IT DOESN'T GET PUSHED OFF-SCREEN!
-        result_label = ttk.Label(test_window, text="[ Awaiting Test... ]", font=("Helvetica", 11, "bold"), foreground="blue", justify="center")
-        result_label.pack(pady=10)
-        
+        t = self._theme
+        BG     = t["BG"]
+        PANEL  = t["PANEL"]
+        BORDER = t["BORDER"]
+        FG     = t["FG"]
+        FG2    = t["FG2"]
+        ENTRY  = t["ENTRY_BG"]
+        test_window.configure(bg=BG)
+
+        # ── Header ───────────────────────────────────────────────────────────
+        hdr = tk.Frame(test_window, bg=BG)
+        hdr.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(hdr, text="Resume Match Simulator",
+                 bg=BG, fg="#93c5fd", font=("Segoe UI", 14, "bold")).pack(side="left")
+        tk.Label(hdr, text="Paste a job description to see which resume wins",
+                 bg=BG, fg=FG2, font=("Segoe UI", 9)).pack(side="left", padx=(12, 0))
+
+        # ── Result panel (initially hidden content) ───────────────────────────
+        result_frame = tk.Frame(test_window, bg=PANEL, bd=0,
+                                highlightthickness=1, highlightbackground=BORDER)
+        result_frame.pack(fill="x", padx=12, pady=4)
+
+        # Winner row
+        winner_row = tk.Frame(result_frame, bg=PANEL)
+        winner_row.pack(fill="x", padx=10, pady=(8, 2))
+
+        winner_icon = tk.Label(winner_row, text="⭐", bg=PANEL,
+                               font=("Segoe UI", 16))
+        winner_icon.pack(side="left", padx=(0, 8))
+
+        winner_name_lbl = tk.Label(winner_row, text="[ Awaiting test... ]",
+                                   bg=PANEL, fg="#4ade80",
+                                   font=("Segoe UI", 12, "bold"), anchor="w")
+        winner_name_lbl.pack(side="left", fill="x", expand=True)
+
+        conf_pct_lbl = tk.Label(winner_row, text="",
+                                bg=PANEL, fg="#fbbf24",
+                                font=("Segoe UI", 13, "bold"))
+        conf_pct_lbl.pack(side="right", padx=8)
+
+        # Confidence bar
+        conf_bar_frame = tk.Frame(result_frame, bg=PANEL)
+        conf_bar_frame.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(conf_bar_frame, text="Confidence:", bg=PANEL, fg=FG2,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 6))
+        conf_bar_bg = tk.Frame(conf_bar_frame, bg="#374151", height=10)
+        conf_bar_bg.pack(side="left", fill="x", expand=True)
+        conf_bar_fill = tk.Frame(conf_bar_bg, bg="#16a34a", height=10, width=0)
+        conf_bar_fill.place(x=0, y=0, relheight=1.0)
+
+        # Stat cards row
+        stats_row = tk.Frame(result_frame, bg=PANEL)
+        stats_row.pack(fill="x", padx=10, pady=4)
+
+        def _mini_card(parent, label, val_text="—", bg="#1a2a4a", fg="#60a5fa"):
+            f = tk.Frame(parent, bg=bg, bd=0, highlightthickness=1,
+                         highlightbackground=BORDER)
+            f.pack(side="left", padx=3, pady=2, ipadx=8, ipady=4)
+            tk.Label(f, text=label, bg=bg, fg=FG2,
+                     font=("Segoe UI", 7, "bold")).pack()
+            v = tk.Label(f, text=val_text, bg=bg, fg=fg,
+                         font=("Segoe UI", 11, "bold"))
+            v.pack()
+            return v
+
+        cov_lbl    = _mini_card(stats_row, "COVERAGE",  bg="#1a2a2a", fg="#34d399")
+        sem_lbl    = _mini_card(stats_row, "SEMANTIC",  bg="#1a1a3a", fg="#818cf8")
+        groq_lbl   = _mini_card(stats_row, "GROQ AI",   bg="#2a1a3a", fg="#c084fc")
+        uni_lbl    = _mini_card(stats_row, "UNIQUE KW", bg="#1a2a1a", fg="#4ade80")
+        gen_lbl    = _mini_card(stats_row, "GEN KW",    bg="#2a2a1a", fg="#fbbf24")
+        learn_lbl  = _mini_card(stats_row, "LEARNED",   bg="#2a1a1a", fg="#f87171")
+
+        # Must-have warning banner (hidden by default)
+        must_warn = tk.Label(result_frame, text="", bg="#7f1d1d", fg="#fca5a5",
+                             font=("Segoe UI", 9, "bold"), anchor="w", justify="left")
+
+        # Gap Check Banner (hidden by default)
+        gap_warn_frame = tk.Frame(result_frame, bg="#312e81")
+        gap_warn_lbl = tk.Label(gap_warn_frame, text="", bg="#312e81", fg="#c7d2fe",
+                                font=("Segoe UI", 9, "bold"), anchor="w", justify="left")
+        gap_warn_lbl.pack(side="left", padx=10, pady=4, fill="x", expand=True)
+        gap_add_btn = ttk.Button(gap_warn_frame, text="Save Suggestions", style="Start.TButton")
+        # gap_warn_frame is packed when gaps are found.
+
+        # All profiles ranked table
+        table_frame = tk.Frame(result_frame, bg=PANEL)
+        table_frame.pack(fill="x", padx=10, pady=(4, 8))
+        tk.Label(table_frame, text="All Profiles Ranked:", bg=PANEL, fg=FG2,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+
+        # Scrollable treeview for ranked list
+        tree_frame = tk.Frame(table_frame, bg=PANEL)
+        tree_frame.pack(fill="x")
+        ranked_tree = ttk.Treeview(
+            tree_frame,
+            columns=("rank", "profile", "score", "conf", "cov", "must"),
+            show="headings", height=5
+        )
+        ranked_tree.heading("rank",    text="#")
+        ranked_tree.heading("profile", text="Profile")
+        ranked_tree.heading("score",   text="Score")
+        ranked_tree.heading("conf",    text="Confidence")
+        ranked_tree.heading("cov",     text="Coverage")
+        ranked_tree.heading("must",    text="Must-Have")
+        ranked_tree.column("rank",    width=30,  anchor="center")
+        ranked_tree.column("profile", width=200, anchor="w")
+        ranked_tree.column("score",   width=70,  anchor="center")
+        ranked_tree.column("conf",    width=80,  anchor="center")
+        ranked_tree.column("cov",     width=70,  anchor="center")
+        ranked_tree.column("must",    width=90,  anchor="center")
+        ranked_tree_sb = ttk.Scrollbar(tree_frame, orient="vertical",
+                                       command=ranked_tree.yview)
+        ranked_tree.configure(yscrollcommand=ranked_tree_sb.set)
+        ranked_tree.pack(side="left", fill="x", expand=True)
+        ranked_tree_sb.pack(side="right", fill="y")
+
+        # ── result_label kept for backward compat but hidden ──────────────────
+        result_label = tk.Label(test_window, text="", bg=BG)  # hidden placeholder
+
         def run_test():
             import re
             try:
-                # Configure highlight tags and clear previous highlights
-                job_desc_text.tag_remove("match_unique", "1.0", tk.END)
-                job_desc_text.tag_remove("match_general", "1.0", tk.END)
-                job_desc_text.tag_config("match_unique", background="#aaffaa", foreground="black", font=("Helvetica", 10, "bold")) # Light green
-                job_desc_text.tag_config("match_general", background="#ffffaa", foreground="black") # Yellow
+                # Clear highlights and ranked table
+                job_desc_text.tag_remove("match_unique",   "1.0", tk.END)
+                job_desc_text.tag_remove("match_general",  "1.0", tk.END)
+                job_desc_text.tag_config("match_unique",
+                    background="#16a34a", foreground="white",
+                    font=("Consolas", 9, "bold"))
+                job_desc_text.tag_config("match_general",
+                    background="#d97706", foreground="white")
+                for row in ranked_tree.get_children():
+                    ranked_tree.delete(row)
+                must_warn.pack_forget()
+                gap_warn_frame.pack_forget()
 
                 text = job_desc_text.get("1.0", tk.END).lower()
                 if not text.strip():
-                    result_label.config(text="Please paste some job description text.", foreground="red")
+                    winner_name_lbl.config(text="Please paste some job description text.",
+                                           fg="#f87171")
                     return
-                    
+
                 profiles = getattr(self, "resume_profiles", [])
                 if not profiles:
-                    result_label.config(text="No profiles are configured in settings.", foreground="red")
+                    winner_name_lbl.config(text="No profiles configured in settings.",
+                                           fg="#f87171")
                     return
 
                 from core.matcher import ResumeMatcher
                 matcher = ResumeMatcher(
-                    profiles, 
+                    profiles,
                     semantic_matcher=self.semantic_matcher if self.semantic_enabled else None,
-                    learning_engine=self.learning_engine
+                    learning_engine=self.learning_engine,
+                    groq_scorer=getattr(self, 'groq_scorer', None)
                 )
                 ranked_results = matcher.score_profiles(text)
-                
+
                 if not ranked_results:
-                    result_label.config(text="No keywords matched any configured profile.", foreground="black")
+                    winner_name_lbl.config(text="No keywords matched any profile.",
+                                           fg="#f87171")
                     return
-                    
-                best_match = ranked_results[0]
-                selected_profile_name = best_match['name']
-                tot     = best_match['score']
-                u_sc    = best_match.get('uni_score', 0)
-                g_sc    = best_match.get('gen_score', 0)
-                sem_sc  = best_match.get('semantic_score', 0)
-                learn_sc= best_match.get('learning_boost', 0)
-                
-                matched_reason = (
-                    f"Hybrid Score: {tot}\n"
-                    f"(Unique: {u_sc} | Gen: {g_sc} | Semantic: {sem_sc}% | AI Learning: +{learn_sc})"
+
+                best_match   = ranked_results[0]
+                profile_name = best_match['name']
+                tot          = best_match['score']
+                u_sc         = best_match.get('uni_score', 0)
+                g_sc         = best_match.get('gen_score', 0)
+                sem_sc       = best_match.get('semantic_score', 0)
+                learn_sc     = best_match.get('learning_boost', 0)
+                conf_pct     = best_match.get('confidence_pct', 0.0)
+                groq_sc      = best_match.get('groq_score', 0)
+                coverage     = best_match.get('coverage', 0.0)
+                missing      = best_match.get('missing_must_have', [])
+                groq_rec     = best_match.get('groq_recommendation', '')
+
+                # ── Update winner panel ─────────────────────────────────────────────
+                winner_name_lbl.config(
+                    text=f"⭐  {profile_name}   (Score: {tot})",
+                    fg="#4ade80"
                 )
-                
+                conf_pct_lbl.config(text=f"{conf_pct}% match")
+
+                # Confidence bar fill
+                conf_bar_bg.update_idletasks()
+                bar_w = conf_bar_bg.winfo_width()
+                fill_w = max(4, int(bar_w * conf_pct / 100))
+                bar_color = (
+                    "#16a34a" if conf_pct >= 70 else
+                    "#d97706" if conf_pct >= 40 else
+                    "#dc2626"
+                )
+                conf_bar_fill.config(bg=bar_color, width=fill_w)
+                conf_bar_fill.place(x=0, y=0, relheight=1.0, width=fill_w)
+
+                # Stat cards
+                cov_lbl.config(text=f"{coverage}%")
+                sem_lbl.config(text=f"{sem_sc}%" if sem_sc else "—")
+                groq_lbl.config(text=str(groq_sc) if groq_sc else "—")
+                uni_lbl.config(text=str(round(u_sc, 1)))
+                gen_lbl.config(text=str(round(g_sc, 1)))
+                learn_lbl.config(text=f"+{learn_sc}" if learn_sc else "—")
+
+                # Must-have warning
+                if missing:
+                    must_warn.config(
+                        text=f"  ⚠  Must-have skills MISSING from winner:  {', '.join(missing)}"
+                    )
+                    must_warn.pack(fill="x", padx=10, pady=(2, 4))
+
+                # Groq recommendation
+                if groq_rec:
+                    winner_name_lbl.config(
+                        text=f"⭐  {profile_name}   (Score: {tot})\n    ↳ Groq: {groq_rec}"
+                    )
+
+                # ── Populate ranked table ─────────────────────────────────────────────
+                for i, r in enumerate(ranked_results):
+                    miss = r.get('missing_must_have', [])
+                    must_status = "OK" if not miss else f"Missing {len(miss)}"
+                    row_tag = "winner" if i == 0 else ("disqualified" if r.get('must_have_penalty', 0) < 0 else "")
+                    ranked_tree.insert(
+                        "", "end",
+                        values=(
+                            i + 1,
+                            r['name'],
+                            r['score'],
+                            f"{r.get('confidence_pct', 0)}%",
+                            f"{r.get('coverage', 0)}%",
+                            must_status
+                        ),
+                        tags=(row_tag,)
+                    )
+
+                ranked_tree.tag_configure("winner",       background="#14532d", foreground="#4ade80")
+                ranked_tree.tag_configure("disqualified", background="#450a0a", foreground="#f87171")
+
+                # ── Keyword highlights ────────────────────────────────────────────────────
                 best_used_uni = best_match['matched_uni']
                 best_used_gen = best_match['matched_gen']
 
-                # Highlight matched keywords in the text area using the strict regex matcher
                 for word in best_used_uni:
                     pattern = matcher.build_keyword_pattern(word)
                     if pattern:
                         for match in re.finditer(pattern, text):
-                            start_idx = f"1.0+{match.start()}c"
-                            end_idx = f"1.0+{match.end()}c"
-                            job_desc_text.tag_add("match_unique", start_idx, end_idx)
-                        
+                            job_desc_text.tag_add("match_unique",
+                                                  f"1.0+{match.start()}c",
+                                                  f"1.0+{match.end()}c")
+
                 for word in best_used_gen:
                     pattern = matcher.build_keyword_pattern(word)
                     if pattern:
                         for match in re.finditer(pattern, text):
-                            start_idx = f"1.0+{match.start()}c"
-                            end_idx = f"1.0+{match.end()}c"
-                            job_desc_text.tag_add("match_general", start_idx, end_idx)
+                            job_desc_text.tag_add("match_general",
+                                                  f"1.0+{match.start()}c",
+                                                  f"1.0+{match.end()}c")
 
-                result_string = f"WINNING PROFILE: {selected_profile_name}\nREASON: {matched_reason}\n(Unique: Green Bold | General: Yellow)"
-                result_label.config(text=result_string, foreground="green")
+                # ── Run lightweight Gap Check ───────────────────────────────────────
+                import threading
+                def _run_gap_check():
+                    try:
+                        from core.resume_keyword_scanner import ResumeKeywordScanner
+                        scanner = ResumeKeywordScanner(getattr(self, 'groq_scorer', None))
+                        res_kws = scanner.scan_resume(best_match['file_path'])
+                        jd_kws = scanner.extract_jd_keywords(text)
+                        
+                        prof_dict = next((p for p in profiles if p.get('name') == profile_name), None)
+                        if prof_dict:
+                            gaps = scanner.find_gaps(res_kws, jd_kws, prof_dict)
+                            self.root.after(0, lambda: _show_test_gaps(gaps, prof_dict))
+                    except Exception as e:
+                        print(f"Gap check failed: {e}")
+                        
+                def _show_test_gaps(gaps, prof_dict):
+                    all_gaps = gaps["unique"] + gaps["general"]
+                    if not all_gaps: return
+                    self._save_keyword_suggestions(prof_dict, all_gaps, 'JD matching test')
+                    
+                    gap_warn_lbl.config(
+                        text=f"💡 JD has {len(all_gaps)} keywords your resume contains but profile is missing: {', '.join(all_gaps)}"
+                    )
+                    
+                    def _add_test_gaps():
+                        self._save_keyword_suggestions(prof_dict, all_gaps, 'JD matching test')
+                        gap_warn_frame.pack_forget()
+                        
+                    gap_add_btn.config(command=_add_test_gaps)
+                    gap_add_btn.pack(side="right", padx=10, pady=4)
+                    gap_warn_frame.pack(fill="x", padx=10, pady=(2, 4), before=table_frame)
+
+                threading.Thread(target=_run_gap_check, daemon=True).start()
+
             except Exception as e:
-                result_label.config(text=f"Error occurred during calculation: {str(e)}", foreground="red")
+                winner_name_lbl.config(text=f"Error: {str(e)}", fg="#f87171")
                 print(f"Test Simulator Error: {e}")
-                
-            # Force UI update
+
             test_window.update_idletasks()
 
-        ttk.Button(test_window, text="Test Match ->", command=run_test).pack(pady=5)
-        
-        # Add Input text area LAST so it expands but doesn't push elements out of the window
-        ttk.Label(test_window, text="Job Description Data:").pack(padx=10, pady=2, anchor="w")
-        job_desc_text = scrolledtext.ScrolledText(test_window, height=15, wrap=tk.WORD)
-        job_desc_text.pack(fill="both", expand=True, padx=10, pady=5)
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_row = tk.Frame(test_window, bg=BG)
+        btn_row.pack(fill="x", padx=12, pady=4)
+        ttk.Button(btn_row, text="Run Match Test",
+                   command=run_test, style="Start.TButton").pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="Clear",
+                   command=lambda: [
+                       job_desc_text.delete("1.0", tk.END),
+                       winner_name_lbl.config(text="[ Awaiting test... ]", fg="#4ade80"),
+                       conf_pct_lbl.config(text=""),
+                       conf_bar_fill.place(x=0, y=0, relheight=1.0, width=0),
+                       [cov_lbl.config(text="—"), sem_lbl.config(text="—"),
+                        groq_lbl.config(text="—"), uni_lbl.config(text="—"),
+                        gen_lbl.config(text="—"), learn_lbl.config(text="—")],
+                       [ranked_tree.delete(r) for r in ranked_tree.get_children()],
+                       must_warn.pack_forget(),
+                       gap_warn_frame.pack_forget()
+                   ],
+                   style="Stop.TButton").pack(side="left")
+        tk.Label(btn_row,
+                 text="Green = Unique KW  |  Orange = General KW  |  Red row = Disqualified (must_have)",
+                 bg=BG, fg=FG2, font=("Segoe UI", 8)).pack(side="right", padx=8)
+
+        # ── Job description input area ────────────────────────────────────────
+        tk.Label(test_window, text="Job Description:",
+                 bg=BG, fg=FG2, font=("Segoe UI", 9)).pack(padx=12, anchor="w")
+        job_desc_text = tk.Text(
+            test_window, height=12, wrap=tk.WORD,
+            bg=ENTRY, fg=FG, insertbackground=FG,
+            font=("Consolas", 9), relief="flat",
+            highlightthickness=1, highlightbackground=BORDER
+        )
+        job_desc_text.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+        job_desc_text.focus_set()
         
     def setup_settings_tab(self):
         """Set up the settings tab UI — wrapped in a scrollable canvas so nothing gets clipped."""
@@ -1046,6 +2038,38 @@ class DiceAutoBotApp:
         canvas.pack(side="left", fill="both", expand=True)
 
         parent = self.settings_scroll_frame
+        
+        top_frame = ttk.LabelFrame(parent, text="App Configuration")
+        top_frame.pack(fill="x", padx=15, pady=10)
+        self.headless_var = tk.BooleanVar(value=getattr(self, 'headless_mode', False))
+        ck_headless = LabeledToggleSwitch(
+            top_frame,
+            text="Headless Mode",
+            variable=self.headless_var,
+            command=self.save_config,
+            bg=self._theme["PANEL"], fg=self._theme["FG"]
+        )
+        ck_headless.pack(side="left", padx=10, pady=8)
+
+        self.batch_save_var = tk.BooleanVar(value=getattr(self, 'batch_excel_saves', True))
+        ck_batch = LabeledToggleSwitch(
+            top_frame,
+            text="Batch Excel Saves",
+            variable=self.batch_save_var,
+            command=self.save_config,
+            bg=self._theme["PANEL"], fg=self._theme["FG"]
+        )
+        ck_batch.pack(side="left", padx=10, pady=8)
+
+        self.keep_awake_var = tk.BooleanVar(value=getattr(self, 'keep_screen_awake', True))
+        ck_keep_awake = LabeledToggleSwitch(
+            top_frame,
+            text="Keep Screen Awake (Prevent Sleep)",
+            variable=self.keep_awake_var,
+            command=self.save_config,
+            bg=self._theme["PANEL"], fg=self._theme["FG"]
+        )
+        ck_keep_awake.pack(side="left", padx=10, pady=8)
 
         # ── Group 1: Dice.com Login ──────────────────────────────────────────
         login_frame = ttk.LabelFrame(parent, text="Dice Account Credentials")
@@ -1062,19 +2086,10 @@ class DiceAutoBotApp:
 
         self.test_login_button = ttk.Button(login_frame, text="✔ Test Login Connection", command=self.test_login)
         self.test_login_button.grid(row=2, column=0, columnspan=2, pady=15)
-
         # ── Group 2: Automation Controls ─────────────────────────────────────
         settings_frame = ttk.LabelFrame(parent, text="Automation Behavior")
         settings_frame.pack(fill="x", padx=15, pady=10)
         settings_frame.columnconfigure(1, weight=1)
-
-        # Headless mode
-        self.headless_var = tk.BooleanVar(value=self.headless_mode)
-        ttk.Checkbutton(
-            settings_frame,
-            text="Headless Mode (Hide Chrome while applying)",
-            variable=self.headless_var
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=8)
 
         # Job limit
         ttk.Label(settings_frame, text="Stop at Job Limit:").grid(row=1, column=0, sticky="w", padx=10, pady=8)
@@ -1085,10 +2100,12 @@ class DiceAutoBotApp:
         
         # Semantic AI Toggle
         self.semantic_var = tk.BooleanVar(value=self.semantic_enabled)
-        ttk.Checkbutton(
+        from utils.config_manager import ConfigManager
+        LabeledToggleSwitch(
             settings_frame,
             text="Enable AI Semantic Matching (Understanding meanings/concepts)",
-            variable=self.semantic_var
+            variable=self.semantic_var,
+            bg=self._theme["PANEL"], fg=self._theme["FG"]
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=8)
 
         # AI Memory Reset
@@ -1116,6 +2133,243 @@ class DiceAutoBotApp:
             text="💡 Tip: Semantic matching is 'Smart'. It knows that 'Data Engineer' is 80% similar\nto 'ETL Engineer' even if keywords don't match exactly.",
             foreground="#666", font=("Segoe UI", 8, "italic")
         ).grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(5, 10))
+
+        # ── Group: Application Wizard Answers ───────────────────────────────
+        answers_frame = ttk.LabelFrame(parent, text="Application Wizard Answers")
+        answers_frame.pack(fill="x", padx=15, pady=10)
+
+        ttk.Label(
+            answers_frame,
+            text=(
+                "Only answers you explicitly configure are used. The bot never assumes legal, work-authorization, "
+                "sponsorship, salary, or personal facts.\n"
+                "Review every answer before enabling auto-answer. A required unanswered question blocks submission."
+            ),
+            foreground="#888", font=("Segoe UI", 8, "italic")
+        ).pack(padx=10, pady=(6, 2), anchor="w")
+
+        # ── Built-in defaults (mirrors main_script.py default_answers) ──────
+        # Deliberately empty: legal, employment, salary, relocation and personal
+        # answers must come from the user. The backend enforces the same rule.
+        _BUILTIN_DEFAULTS = {}
+
+        safety_controls = ttk.Frame(answers_frame)
+        safety_controls.pack(fill="x", padx=10, pady=(4, 2))
+        self.auto_answer_var = tk.BooleanVar(value=self.auto_answer_questions)
+        self.review_before_submit_var = tk.BooleanVar(value=getattr(self, 'review_before_submit', False))
+        self.allow_ai_answers_var = tk.BooleanVar(value=self.allow_ai_generated_application_answers)
+        self.minimum_ats_var = tk.DoubleVar(value=self.minimum_ats_fit)
+        ttk.Checkbutton(
+            safety_controls,
+            text="Enable configured answers",
+            variable=self.auto_answer_var,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(
+            answers_frame,
+            text="Review visible form before Submit",
+            variable=self.review_before_submit_var,
+            command=lambda: setattr(self, 'review_before_submit', self.review_before_submit_var.get()),
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        ttk.Checkbutton(
+            safety_controls,
+            text="Allow AI for non-sensitive free text",
+            variable=self.allow_ai_answers_var,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Label(safety_controls, text="Minimum ATS fit (0-100):").pack(side="left")
+        ttk.Spinbox(
+            safety_controls,
+            from_=0,
+            to=100,
+            increment=1,
+            textvariable=self.minimum_ats_var,
+            width=6,
+        ).pack(side="left", padx=(4, 0))
+
+        # Treeview — 3 columns: pattern, answer (truncated), source
+        ans_tree_frame = ttk.Frame(answers_frame)
+        ans_tree_frame.pack(fill="x", padx=10, pady=4)
+
+        self._answers_tree = ttk.Treeview(
+            ans_tree_frame,
+            columns=("pattern", "answer", "source"),
+            show="headings",
+            height=16,
+            selectmode="browse"
+        )
+        self._answers_tree.heading("pattern", text="Question Pattern  (label contains...)")
+        self._answers_tree.heading("answer",  text="Answer  (click row to edit)")
+        self._answers_tree.heading("source",  text="Source")
+        self._answers_tree.column("pattern", width=280, stretch=True)
+        self._answers_tree.column("answer",  width=260, stretch=True)
+        self._answers_tree.column("source",  width=80,  stretch=False)
+        self._answers_tree.pack(side="left", fill="x", expand=True)
+
+        ans_sb = ttk.Scrollbar(ans_tree_frame, orient="vertical", command=self._answers_tree.yview)
+        self._answers_tree.configure(yscrollcommand=ans_sb.set)
+        ans_sb.pack(side="right", fill="y")
+
+        # Tag colours
+        self._answers_tree.tag_configure("builtin", foreground="#888888")
+        self._answers_tree.tag_configure("custom",  foreground="#4ade80")
+
+        def _refresh_answers_tree():
+            self._answers_tree.delete(*self._answers_tree.get_children())
+            user_answers = getattr(self, 'application_answers', {})
+            for k, v in sorted(user_answers.items()):
+                tag = "custom"
+                source = "Explicit"
+                display_v = (v[:60] + "…") if len(v) > 60 else v
+                self._answers_tree.insert("", "end", values=(k, display_v, source), tags=(tag,))
+
+        _refresh_answers_tree()
+
+        def _review_questions():
+            from utils.question_review import open_question_review
+            open_question_review(self)
+
+        ttk.Button(answers_frame, text="Review Unanswered Questions", command=_review_questions,
+                   style="Start.TButton").pack(anchor="w", padx=10, pady=6)
+
+        catalog_row = ttk.Frame(answers_frame)
+        catalog_row.pack(fill="x", padx=10, pady=(6, 2))
+        ttk.Label(catalog_row, text="Add common question:").pack(side="left", padx=(0, 6))
+        catalog_entries = application_question_catalog_items()
+        self._answer_catalog_map = {
+            f"{category} — {pattern}": pattern for category, pattern in catalog_entries
+        }
+        self._answer_catalog_var = tk.StringVar(value="Select a question pattern…")
+        catalog_combo = ttk.Combobox(
+            catalog_row,
+            textvariable=self._answer_catalog_var,
+            values=list(self._answer_catalog_map),
+            state="readonly",
+            width=52,
+        )
+        catalog_combo.pack(side="left", padx=(0, 12))
+
+        ttk.Label(catalog_row, text="Quick answer:").pack(side="left", padx=(0, 6))
+        self._answer_quick_var = tk.StringVar(value="Choose…")
+        quick_combo = ttk.Combobox(
+            catalog_row,
+            textvariable=self._answer_quick_var,
+            values=("Yes", "No", "Open to discuss", "Immediately", "Not applicable", "Prefer not to answer"),
+            state="readonly",
+            width=20,
+        )
+        quick_combo.pack(side="left")
+
+        # ── Edit area ─────────────────────────────────────────────────────────
+        edit_outer = ttk.Frame(answers_frame)
+        edit_outer.pack(fill="x", padx=10, pady=(6, 2))
+
+        # Left: pattern entry
+        left_col = ttk.Frame(edit_outer)
+        left_col.pack(side="left", fill="y", padx=(0, 10))
+        ttk.Label(left_col, text="Question Pattern:").pack(anchor="w")
+        self._ans_pattern_entry = ttk.Entry(left_col, width=32)
+        self._ans_pattern_entry.pack(anchor="w", pady=(2, 0))
+        ttk.Label(left_col, text="(text that appears in the question label)",
+                  font=("Segoe UI", 7, "italic"), foreground="#666").pack(anchor="w")
+
+        # Right: answer text box (multi-line for long answers)
+        right_col = ttk.Frame(edit_outer)
+        right_col.pack(side="left", fill="both", expand=True)
+        ttk.Label(right_col, text="Answer:").pack(anchor="w")
+        self._ans_answer_text = tk.Text(
+            right_col, height=4, wrap=tk.WORD,
+            font=("Segoe UI", 9),
+            relief="flat", highlightthickness=1,
+            highlightbackground=self._theme.get("BORDER", "#333")
+        )
+        self._ans_answer_text.pack(fill="both", expand=True, pady=(2, 0))
+
+        def _select_catalog_question(event=None):
+            pattern = self._answer_catalog_map.get(self._answer_catalog_var.get(), "")
+            if not pattern:
+                return
+            self._ans_pattern_entry.delete(0, tk.END)
+            self._ans_pattern_entry.insert(0, pattern)
+            existing = getattr(self, 'application_answers', {}).get(pattern, "")
+            self._ans_answer_text.delete("1.0", tk.END)
+            if existing:
+                self._ans_answer_text.insert("1.0", existing)
+
+        def _select_quick_answer(event=None):
+            answer = self._answer_quick_var.get()
+            if answer and answer != "Choose…":
+                self._ans_answer_text.delete("1.0", tk.END)
+                self._ans_answer_text.insert("1.0", answer)
+
+        catalog_combo.bind("<<ComboboxSelected>>", _select_catalog_question)
+        quick_combo.bind("<<ComboboxSelected>>", _select_quick_answer)
+
+        def _on_ans_select(event):
+            sel = self._answers_tree.selection()
+            if not sel:
+                return
+            pat = self._answers_tree.item(sel[0])["values"][0]
+            # Look up the FULL answer (treeview truncates it)
+            user_answers = getattr(self, 'application_answers', {})
+            full_ans = user_answers.get(pat, "")
+            self._ans_pattern_entry.delete(0, tk.END)
+            self._ans_pattern_entry.insert(0, pat)
+            self._ans_answer_text.delete("1.0", tk.END)
+            self._ans_answer_text.insert("1.0", full_ans)
+
+        self._answers_tree.bind("<<TreeviewSelect>>", _on_ans_select)
+
+        def _save_answer():
+            pat = self._ans_pattern_entry.get().strip().lower()
+            ans = self._ans_answer_text.get("1.0", tk.END).strip()
+            if not pat or not ans:
+                messagebox.showwarning("Missing Fields", "Enter both a question pattern and an answer.")
+                return
+            if not hasattr(self, 'application_answers') or not isinstance(self.application_answers, dict):
+                self.application_answers = {}
+            self.application_answers[pat] = ans
+            self.save_config(silent=True)
+            _refresh_answers_tree()
+            self._ans_pattern_entry.delete(0, tk.END)
+            self._ans_answer_text.delete("1.0", tk.END)
+
+        def _delete_answer():
+            """Delete the selected explicitly configured answer."""
+            sel = self._answers_tree.selection()
+            if not sel:
+                return
+            pat = self._answers_tree.item(sel[0])["values"][0]
+            answers = getattr(self, 'application_answers', {})
+            if pat not in answers:
+                messagebox.showinfo("Not Found", "The selected answer is no longer configured.")
+                return
+            answers.pop(pat, None)
+            self.application_answers = answers
+            self.save_config(silent=True)
+            _refresh_answers_tree()
+            self._ans_pattern_entry.delete(0, tk.END)
+            self._ans_answer_text.delete("1.0", tk.END)
+
+        def _add_new_answer():
+            """Add a completely new pattern not in defaults."""
+            pat = self._ans_pattern_entry.get().strip().lower()
+            ans = self._ans_answer_text.get("1.0", tk.END).strip()
+            if not pat or not ans:
+                messagebox.showwarning("Missing Fields", "Enter a question pattern and an answer.")
+                return
+            if not hasattr(self, 'application_answers') or not isinstance(self.application_answers, dict):
+                self.application_answers = {}
+            self.application_answers[pat] = ans
+            self.save_config(silent=True)
+            _refresh_answers_tree()
+            self._ans_pattern_entry.delete(0, tk.END)
+            self._ans_answer_text.delete("1.0", tk.END)
+
+        btn_row_ans = ttk.Frame(answers_frame)
+        btn_row_ans.pack(fill="x", padx=10, pady=(4, 8))
+        ttk.Button(btn_row_ans, text="💾 Save Explicit Answer", command=_save_answer,
+                   style="Start.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row_ans, text="Delete Selected", command=_delete_answer).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row_ans, text="+ Add New Pattern", command=_add_new_answer).pack(side="left")
 
         # Save button
         self.save_settings_button = ttk.Button(
@@ -1210,8 +2464,8 @@ Dice Auto-Apply Bot Guide
         # Get the most recent log file
         latest_log = max(log_files, key=os.path.getmtime)
         try:
-            with open(latest_log, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
+            from utils.log_view import read_log_tail
+            content = read_log_tail(latest_log)
 
             self.full_log_text.config(state="normal")
             self.full_log_text.delete("1.0", tk.END)
@@ -1227,6 +2481,67 @@ Dice Auto-Apply Bot Guide
         self.full_log_text.config(state="normal")
         self.full_log_text.delete("1.0", tk.END)
         self.full_log_text.config(state="disabled")
+
+    def _log_match_details(self, profile_name, match_reason):
+        """Intelligently formats and logs the resume match metrics and keywords to the log widget.
+        
+        match_reason format (from main_script.py):
+            "ATS Match: X% | Conf: X% | Score: N | Matched: [...] | Skill Gap (Missing): [...] | AI: X% | Name: X%"
+        """
+        if not profile_name or profile_name == "Default/None":
+            self.logger.info("Using default resume (No keywords matched or no matching profiles).")
+            return
+            
+        if match_reason and " | " in match_reason:
+            try:
+                import re as _re
+
+                # Extract ATS match score (e.g. "ATS Match: 93.1%")
+                _ats_m = _re.search(r'ATS Match:\s*([\d.]+%?)', match_reason)
+                ats_str = _ats_m.group(1) if _ats_m else ""
+
+                # Extract confidence (e.g. "Conf: 87.5%")
+                _conf_m = _re.search(r'Conf:\s*([\d.]+%?)', match_reason)
+                conf_str = _conf_m.group(1) if _conf_m else ""
+
+                # Extract raw score (e.g. "Score: 142")
+                _score_m = _re.search(r'Score:\s*([\d.]+)', match_reason)
+                score_str = _score_m.group(1) if _score_m else ""
+
+                # Extract keywords inside Matched: [...]
+                kw_str = ""
+                _kw_m = _re.search(r'Matched:\s*\[([^\]]*)\]', match_reason)
+                if _kw_m:
+                    kw_str = _kw_m.group(1).strip()
+
+                # Build a clean summary line
+                summary_parts = []
+                if ats_str:
+                    summary_parts.append(f"ATS Match: {ats_str}")
+                if conf_str:
+                    summary_parts.append(f"Conf: {conf_str}")
+                if score_str:
+                    summary_parts.append(f"Score: {score_str}")
+                summary = ", ".join(summary_parts) if summary_parts else match_reason[:80]
+
+                self.logger.info(f"Matched Resume: '{profile_name}' ({summary})")
+
+                # Format keywords nicely if they exist
+                if kw_str:
+                    try:
+                        from core.outreach.skill_ranker import _fmt_skill
+                        formatted_kws = ", ".join(_fmt_skill(s.strip()) for s in kw_str.split(",") if s.strip())
+                        self.logger.info(f"Matched Skills: {formatted_kws}")
+                    except Exception:
+                        self.logger.info(f"Matched Skills: {kw_str}")
+                else:
+                    self.logger.info("Matched Skills: None (Name Affinity / exact match boost only)")
+                return
+            except Exception:
+                pass
+        
+        # Fallback to raw string if parsing fails
+        self.logger.info(f"Using Resume: {profile_name} | {match_reason}")
 
     def open_log_folder(self):
         """Open the logs directory in explorer"""
@@ -1266,7 +2581,7 @@ Dice Auto-Apply Bot Guide
             except Exception as e:
                 self.logger.error(f"Login test error: {str(e)}")
                 # Update UI from the main thread
-                self.root.after(0, lambda: self.test_login_complete(False, str(e)))
+                self.root.after(0, lambda error=str(e): self.test_login_complete(False, error))
                 
         # Run the test in a separate thread
         threading.Thread(target=test_login_thread, daemon=True).start()
@@ -1305,13 +2620,28 @@ Dice Auto-Apply Bot Guide
         include_keywords = [k.strip() for k in self.include_keywords_entry.get().split(",") if k.strip()]
         job_limit = self.job_limit_var.get()
         profile_boost_mode = self.name_boost_var.get().split('|')[0].strip().lower()
+        emp_type = self.emp_type_var.get()
+        posted_date = self.posted_date_var.get()
+        work_setting = self.work_setting_var.get()
+        easy_apply = self.easy_apply_var.get()
+        location = self.location_entry.get().strip()
+        radius = self.radius_var.get()
+        will_sponsor = self.will_sponsor_var.get()
+        salary_min = self.salary_min_entry.get().strip()
+        # Snapshot every Tk value on the UI thread. Background workers must not
+        # call Variable.get() or read stale constructor-time attributes.
+        headless_mode = bool(self.headless_var.get())
+        keep_screen_awake = bool(self.keep_awake_var.get())
+        batch_excel_saves = bool(self.batch_save_var.get())
 
         # Update UI
         self.running = True
         self.is_paused = False
+        self.skip_requested = False
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         self.pause_button.config(state="normal", text="⏸  Pause")
+        self.skip_button.config(state="disabled")
         self.progress_bar["value"] = 0
         self.status_label.config(text="Starting...")
         
@@ -1319,6 +2649,8 @@ Dice Auto-Apply Bot Guide
         self.jobs_found_label.config(text="0")
         self.jobs_applied_label.config(text="0")
         self.jobs_failed_label.config(text="0")
+        self._skipped_job_keys = set()
+        self.jobs_skipped_label.config(text="0")
         
         # Clear log text
         self.log_text.config(state="normal")
@@ -1328,7 +2660,11 @@ Dice Auto-Apply Bot Guide
         # Run job application process in a separate thread
         self.job_thread = threading.Thread(
             target=self.run_job_application,
-            args=(search_queries, include_keywords, exclude_keywords, username, password, job_limit, profile_boost_mode),
+            args=(
+                search_queries, include_keywords, exclude_keywords, username, password, job_limit, profile_boost_mode,
+                emp_type, posted_date, work_setting, easy_apply, location, radius, will_sponsor, salary_min,
+                headless_mode, keep_screen_awake, batch_excel_saves
+            ),
             daemon=True
         )
         self.job_thread.start()
@@ -1341,28 +2677,48 @@ Dice Auto-Apply Bot Guide
         self.is_paused = not self.is_paused
         if self.is_paused:
             self.pause_button.config(text="▶  Resume")
+            self.skip_button.config(state="disabled")
             self.update_status("⏸  Application PAUSED. Bot is waiting...")
         else:
             self.pause_button.config(text="⏸  Pause")
+            self.skip_button.config(state="normal")
             self.update_status("▶  Application RESUMED.")
 
     def check_pause(self):
-        """Returns True if the bot has been stopped. Will block if paused."""
-        while self.is_paused and self.running:
+        """
+        Blocks while paused.
+        Returns 'stop' if the bot was stopped, 'skip' if the user clicked Skip,
+        or False if execution should continue normally.
+        Callers can do `if check_pause():` as before (truthy for stop/skip),
+        but can also distinguish the two cases with == comparison.
+        """
+        while self.is_paused and self.running and not self.skip_requested:
             time.sleep(0.5)
-        return not self.running
+        if not self.running:
+            return "stop"
+        if self.skip_requested:
+            return "skip"
+        return False
 
-    def run_job_application(self, search_queries, include_keywords, exclude_keywords, username, password, job_limit, profile_boost_mode):
+    def run_job_application(self, search_queries, include_keywords, exclude_keywords, username, password, job_limit, profile_boost_mode, emp_type, posted_date, work_setting, easy_apply=False, location="", radius="30", will_sponsor=False, salary_min="", headless_mode=False, keep_screen_awake=True, batch_excel_saves=True):
         """Run the job application process in a background thread"""
         try:
+            from core.state_store import StateStore
+            self._dice_recovery = StateStore()
+            self._dice_run = self._dice_recovery.start_run('dice', {'queries': search_queries, 'include': include_keywords, 'exclude': exclude_keywords})
+            # Enable Keep-Awake if configured
+            if keep_screen_awake:
+                prevent_sleep()
+                self.logger.info("🔒 Screen keep-awake active (display & system sleep disabled during job apply)")
+
             # Record start time
             start_time = time.time()
             self.logger.info(f"Starting job applications with queries: {search_queries}")
             
             # Initialize web driver
             self.update_status("Initializing web driver...")
-            headless = self.headless_var.get()
-            driver = get_web_driver()
+            driver = get_web_driver(headless=headless_mode)
+            self.driver = driver
             
             # Login to Dice
             self.update_status("Logging in to Dice...")
@@ -1373,15 +2729,20 @@ Dice Auto-Apply Bot Guide
                     "Login Failed", 
                     "Could not log in to Dice. Please check your credentials."
                 ))
-                driver.quit()
-                self.reset_ui()
                 return
                     
             self.update_status("Login successful. Fetching jobs...")
             
             # Find jobs matching the search queries
+            import random
             all_jobs = {}
+            if getattr(self, '_selected_retry_jobs', None):
+                all_jobs = {j['Job URL']: j for j in self._selected_retry_jobs}
+                self._selected_retry_jobs = None
+                search_queries = []
             excluded_jobs = []  # Track excluded jobs
+            
+            random.shuffle(search_queries)
             total_queries = len(search_queries)
             
             for i, query in enumerate(search_queries):
@@ -1390,14 +2751,17 @@ Dice Auto-Apply Bot Guide
                     time.sleep(1)
                 if not self.running:
                     self.update_status("Stopped by user.")
-                    driver.quit()
-                    self.reset_ui()
                     return
                     
                 self.update_status(f"Searching for '{query}' ({i+1}/{total_queries})...")
                 
                 # Use the fetch_jobs_with_requests function
-                jobs, excluded = fetch_jobs_with_requests(driver, query, include_keywords, exclude_keywords, pause_check=self.check_pause)
+                jobs, excluded = fetch_jobs_with_requests(
+                    driver, query, include_keywords, exclude_keywords, pause_check=self.check_pause,
+                    emp_type=emp_type, posted_date=posted_date, work_setting=work_setting,
+                    easy_apply=easy_apply, location=location, radius=radius,
+                    will_sponsor=will_sponsor, salary_min=salary_min
+                )
                 
                 # Track counts before adding new jobs
                 jobs_before = len(all_jobs)
@@ -1418,6 +2782,7 @@ Dice Auto-Apply Bot Guide
                 self.root.after(0, lambda c=count_to_display: self.jobs_found_label.config(text=str(c)))
                 
                 # Print debug info
+                self.logger.info(f"Query '{query}': Found {len(jobs)} total jobs, added {current_count - jobs_before} unique jobs")
                 print(f"Query '{query}': Found {len(jobs)} total jobs, added {current_count - jobs_before} unique jobs")
                 
                 # Move mouse to prevent sleeping
@@ -1429,7 +2794,7 @@ Dice Auto-Apply Bot Guide
             self.update_status(f"Found {final_count} unique jobs matching criteria")
             self.root.after(0, lambda c=final_count: self.jobs_found_label.config(text=str(c)))
             
-            # Save excluded jobs to Excel
+            # Save excluded jobs to Excel + update skip stats bar keyword counter
             if excluded_jobs:
                 try:
                     excluded_file = "excluded_jobs.xlsx"
@@ -1438,22 +2803,66 @@ Dice Auto-Apply Bot Guide
                     self.logger.info(f"Saved {len(excluded_jobs)} excluded jobs to {excluded_file}")
                 except Exception as e:
                     self.logger.error(f"Error saving excluded jobs: {e}")
+                for excluded_job in excluded_jobs:
+                    self._record_skipped_job(excluded_job)
             
             # Check for already applied jobs
             self.update_status("Checking for already applied jobs...")
             applied_jobs_file = "applied_jobs.xlsx"
-            already_applied = set()
-            
+            # Normalize to lowercase + strip trailing slash for reliable dedup (Bug 6)
+            already_applied: set = set()
+
             if os.path.exists(applied_jobs_file):
                 try:
                     df_applied = pd.read_excel(applied_jobs_file)
-                    already_applied = set(df_applied["Job URL"].dropna())
+                    already_applied = set(
+                        url.lower().rstrip('/') for url in df_applied["Job URL"].dropna()
+                    )
                     self.update_status(f"Found {len(already_applied)} previously applied jobs to skip")
                 except Exception as e:
                     self.logger.error(f"Error reading applied jobs file: {e}")
-            
-            # Filter out already applied jobs
-            jobs_to_apply = [job for job in all_jobs.values() if job["Job URL"] not in already_applied]
+
+            # Bug 7: Also skip terminal (non-retryable) failures from previous runs.
+            # Transient failures (button timeout, wizard errors) are NOT filtered — those
+            # are legitimately worth retrying in the next run. Only permanent terminal
+            # outcomes are excluded: already applied, user-skipped, excluded keywords, C2C filters, low match score.
+            _not_applied_file = "not_applied_jobs.xlsx"
+            _TERMINAL_SIGNALS = (
+                "already applied", "skipped by user",
+                "excluded keyword", "lacks c2c", "full-time without c2c",
+                "w2-only", "low ats match", "low ats fit score", "ats fit score",
+                "score below threshold", "employment type mismatch",
+                "skipped (c2c", "skipped (excluded"
+            )
+            if os.path.exists(_not_applied_file):
+                try:
+                    df_not = pd.read_excel(_not_applied_file)
+                    if "Job URL" in df_not.columns and "Skip Reason" in df_not.columns:
+                        _terminal_mask = df_not["Skip Reason"].astype(str).str.lower().apply(
+                            lambda r: any(sig in r for sig in _TERMINAL_SIGNALS)
+                        )
+                        _terminal_urls = set(
+                            url.lower().rstrip('/')
+                            for url in df_not.loc[_terminal_mask, "Job URL"].dropna()
+                        )
+                        already_applied.update(_terminal_urls)
+                        if _terminal_urls:
+                            self.logger.info(
+                                f"Excluding {len(_terminal_urls)} previously skipped/unapplied job(s) "
+                                f"from run list (Excluded Keywords / C2C Filters / Low Match Score)."
+                            )
+                except Exception as _nae:
+                    self.logger.error(f"Error reading not_applied_jobs file: {_nae}")
+
+            for saved_job in all_jobs.values():
+                if saved_job["Job URL"].lower().rstrip('/') in already_applied:
+                    self._record_skipped_job(saved_job)
+
+            # Filter out already applied / terminally-failed jobs (case-insensitive URL match)
+            jobs_to_apply = [
+                job for job in all_jobs.values()
+                if job["Job URL"].lower().rstrip('/') not in already_applied
+            ]
             self.update_status(f"Applying to {len(jobs_to_apply)} jobs...")
 
             # Update the Total Jobs count to show the jobs that will be processed
@@ -1461,12 +2870,14 @@ Dice Auto-Apply Bot Guide
             self.root.after(0, lambda c=jobs_to_process_count: self.jobs_found_label.config(text=str(c)))
 
             # Apply job limit if set
-            job_limit = self.job_limit_var.get()
             if job_limit > 0 and len(jobs_to_apply) > job_limit:
                 limited_count = job_limit
                 self.update_status(f"Limiting to {job_limit} jobs as per settings")
                 jobs_to_apply = jobs_to_apply[:job_limit]
                 self.root.after(0, lambda c=limited_count: self.jobs_found_label.config(text=str(c)))
+
+            for pending_job in jobs_to_apply:
+                self._dice_checkpoint(pending_job, 'pending')
 
             # Calculate initial estimated time (assuming 10 jobs per minute)
             jobs_per_minute = 10.0
@@ -1490,6 +2901,25 @@ Dice Auto-Apply Bot Guide
                 self.update_status(f"Estimated completion time: {initial_estimate}")
                 self.root.after(0, lambda t=initial_estimate: self.estimated_time_label.config(text=t))
             
+            # Enable Skip button now that we are actually applying
+            self.root.after(0, lambda: self.skip_button.config(state="normal" if not self.is_paused else "disabled"))
+
+            # Bug 3 Fix: Build ResumeMatcher once per session, not once per job.
+            # This avoids re-compiling all keyword patterns for every single application.
+            from core.matcher import ResumeMatcher
+            try:
+                _session_matcher = ResumeMatcher(
+                    getattr(self, "resume_profiles", []),
+                    semantic_matcher=self.semantic_matcher if getattr(self, 'semantic_enabled', False) else None,
+                    learning_engine=self.learning_engine,
+                    groq_scorer=getattr(self, 'groq_scorer', None)
+                )
+            except Exception as _me:
+                self.logger.warning(f"Could not pre-build ResumeMatcher: {_me}. Will build per-job.")
+                _session_matcher = None
+
+
+
             # Start applying to jobs
             applied_count = 0
             failed_count = 0
@@ -1498,14 +2928,48 @@ Dice Auto-Apply Bot Guide
             job_start_times = []
             job_processing_times = []
             
+            # Batch buffers for Excel saves
+            batch_applied = []
+            batch_not_applied = []
+            
+            def flush_excel_batches(force=False):
+                if not batch_excel_saves:
+                    force = True # if batching is off, always force save
+                
+                # Flush applied jobs
+                if len(batch_applied) >= 10 or (force and batch_applied):
+                    try:
+                        if os.path.exists("applied_jobs.xlsx"):
+                            df_ex = pd.read_excel("applied_jobs.xlsx")
+                            df_new = pd.DataFrame(batch_applied)
+                            df_combined = pd.concat([df_ex, df_new], ignore_index=True)
+                        else:
+                            df_combined = pd.DataFrame(batch_applied)
+                        self.save_dataframe_to_excel_safely(df_combined, "applied_jobs.xlsx")
+                        batch_applied.clear()
+                    except Exception as e:
+                        self.logger.error(f"Error batch saving applied jobs: {e}")
+                        
+                # Flush not applied jobs
+                if len(batch_not_applied) >= 10 or (force and batch_not_applied):
+                    try:
+                        if os.path.exists("not_applied_jobs.xlsx"):
+                            df_ex = pd.read_excel("not_applied_jobs.xlsx")
+                            df_new = pd.DataFrame(batch_not_applied)
+                            df_combined = pd.concat([df_ex, df_new], ignore_index=True)
+                        else:
+                            df_combined = pd.DataFrame(batch_not_applied)
+                        self.save_dataframe_to_excel_safely(df_combined, "not_applied_jobs.xlsx")
+                        batch_not_applied.clear()
+                    except Exception as e:
+                        self.logger.error(f"Error batch saving not applied jobs: {e}")
+
             for i, job in enumerate(jobs_to_apply):
                 # Check if bot is paused
                 while self.is_paused and self.running:
                     time.sleep(1)
                 if not self.running:
                     self.update_status("Stopped by user.")
-                    driver.quit()
-                    self.reset_ui()
                     return
                 
                 # Record job start time for this specific job
@@ -1521,22 +2985,94 @@ Dice Auto-Apply Bot Guide
 
                 # Apply to job using your existing function
                 try:
+                    self._dice_checkpoint(job, 'preparing')
+                    driver._before_submit = lambda j=job: self._dice_checkpoint(j, 'external_action_started')
+                    driver._review_before_submit = self._review_dice_submission if self.review_before_submit else None
                     job_result = apply_to_job_url(
-                        driver, 
-                        job["Job URL"], 
-                        getattr(self, "resume_profiles", []), 
+                        driver,
+                        job["Job URL"],
+                        getattr(self, "resume_profiles", []),
                         job_title=job_title,
                         semantic_matcher=self.semantic_matcher if self.semantic_enabled else None,
                         learning_engine=self.learning_engine,
-                        pause_check=self.check_pause
+                        groq_scorer=getattr(self, 'groq_scorer', None),
+                        pause_check=self.check_pause,
+                        headless_mode=headless_mode,
+                        exclude_keywords=exclude_keywords,
+                        skill_gap_callback=self.record_skill_gap,
+                        matcher=_session_matcher
                     )
                     applied_status, profile_name, match_reason, skip_reason, job_desc_text, profile_id = job_result
+                    from core.application_outcome import classify_application_outcome
+                    application_outcome = classify_application_outcome(applied_status, skip_reason)
+                    job["Application Status"] = application_outcome.value
+                    job.update({'Applied': applied_status, 'Resume Profile': profile_name, 'Match Reason': match_reason, 'Skip Reason': skip_reason or ''})
+                    try:
+                        from core.state_store import StateStore
+                        application_state = self._dice_recovery
+                        application_job_key = str(job.get("Job URL", "") or job.get("URL", ""))
+                        application_state.upsert_job(application_job_key, "dice", job)
+                        application_state.record_application_attempt(
+                            application_job_key,
+                            self._dice_run,
+                            application_outcome.value,
+                            skip_reason or "",
+                            str(profile_id or ""),
+                            export_record=dict(job),
+                            export_path='applied_jobs.xlsx' if applied_status else 'not_applied_jobs.xlsx',
+                        )
+                        self._dice_checkpoint(job, 'confirmed' if application_outcome.value in {'applied', 'already_applied', 'skipped'} else ('failed' if application_outcome.value in {'failed', 'blocked'} else 'needs_review'))
+                    except Exception as state_error:
+                        self.running = False
+                        self.logger.error(f"Could not persist application outcome: {state_error}")
+                    
+                    # Check if a skip was requested
+                    if self.skip_requested:
+                        self.logger.info(f"Job application skipped by user: {job_title}")
+                        self._record_skipped_job(job)
+                        self.skip_requested = False
+                        
+                        # Close popup tabs safely
+                        try:
+                            if len(driver.window_handles) > 1:
+                                for handle in list(driver.window_handles)[1:]:
+                                    try:
+                                        driver.switch_to.window(handle)
+                                        driver.close()
+                                    except Exception:
+                                        pass
+                                driver.switch_to.window(driver.window_handles[0])
+                        except Exception as e:
+                            self.logger.error(f"Error restoring window handles after skip: {e}")
+                        
+                        # Log to not applied jobs Excel file
+                        job["Applied"] = False
+                        job["Resume Profile"] = profile_name or "Default/None"
+                        job["Match Reason"] = match_reason or ""
+                        job["Skip Reason"] = "Skipped by user"
+                        batch_not_applied.append(job.copy())
+                        flush_excel_batches()
+                            
+                        failed_count += 1
+                        self.root.after(0, lambda c=failed_count: self.jobs_failed_label.config(text=str(c)))
+                        continue
+
+                    # Check if the driver session is still active/valid
+                    is_driver_active = True
+                    try:
+                        _ = driver.current_url
+                    except Exception:
+                        is_driver_active = False
+
+                    if not is_driver_active:
+                        self.logger.error("WebDriver session lost (browser may have been closed or crashed). Stopping application run.")
+                        self.update_status("WebDriver session lost. Stopped.")
+                        break
                     
                     job["Resume Profile"] = profile_name
                     job["Match Reason"] = match_reason
                     
-                    if profile_name and profile_name != "Default/None":
-                        self.logger.info(f"Using Resume: {profile_name} | {match_reason}")
+                    self._log_match_details(profile_name, match_reason)
                     
                     # Record job completion time and calculate processing time for this job
                     job_end_time = time.time()
@@ -1589,67 +3125,50 @@ Dice Auto-Apply Bot Guide
                                 self.logger.error(f"Failed to record AI learning: {e}")
                         
                         # Save to applied jobs Excel file
-                        try:
-                            job["Applied"] = True
-                            # If Submit was clicked but confirmation wasn't detected, note it for auditing
-                            if skip_reason:
-                                job["Application Note"] = skip_reason
-                            if os.path.exists(applied_jobs_file):
-                                df_existing = pd.read_excel(applied_jobs_file)
-                            else:
-                                df_existing = pd.DataFrame(columns=[
-                                    "Job Title", "Job URL", "Company", "Location", 
-                                    "Employment Type", "Posted Date", "Applied",
-                                    "Resume Profile", "Match Reason", "Application Note"
-                                ])
-                            
-                            df_new = pd.DataFrame([job])
-                            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-                            df_combined.to_excel(applied_jobs_file, index=False)
-                        except Exception as e:
-                            self.logger.error(f"Error updating Excel file: {e}")
+                        job["Applied"] = True
+                        if skip_reason:
+                            job["Application Note"] = skip_reason
+                        batch_applied.append(job.copy())
+                        flush_excel_batches()
                     else:
-                        failed_count += 1
-                        # Update failed count
-                        count_to_display = failed_count
-                        self.root.after(0, lambda c=count_to_display: 
-                            self.jobs_failed_label.config(text=str(c)))
+                        # Expected skips and previously-applied jobs are not bot
+                        # failures. Blocked/unconfirmed/failed attempts remain visible.
+                        if application_outcome.value not in {"already_applied", "skipped"}:
+                            failed_count += 1
+                            count_to_display = failed_count
+                            self.root.after(0, lambda c=count_to_display:
+                                self.jobs_failed_label.config(text=str(c)))
                         
                         # Save to not applied jobs Excel file
-                        not_applied_file = "not_applied_jobs.xlsx"
-                        try:
-                            EXPECTED_COLS = [
-                                "Job Title", "Job URL", "Company", "Location",
-                                "Employment Type", "Posted Date", "Applied",
-                                "Resume Profile", "Match Reason", "Skip Reason"
-                            ]
-                            if os.path.exists(not_applied_file):
-                                df_existing = pd.read_excel(not_applied_file)
-                                # Ensure all expected columns exist in old files
-                                for col in EXPECTED_COLS:
-                                    if col not in df_existing.columns:
-                                        df_existing[col] = ""
-                            else:
-                                df_existing = pd.DataFrame(columns=EXPECTED_COLS)
-
-                            job["Applied"] = False
-                            # Truncate very long reasons so Excel cells stay readable
-                            raw_reason = skip_reason or "Unknown failure"
-                            job["Skip Reason"] = raw_reason[:500] if len(raw_reason) > 500 else raw_reason
-                            df_new = pd.DataFrame([job])
-                            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-                            # Reorder so Skip Reason column is always present and last
-                            for col in EXPECTED_COLS:
-                                if col not in df_combined.columns:
-                                    df_combined[col] = ""
-                            df_combined = df_combined[EXPECTED_COLS + [c for c in df_combined.columns if c not in EXPECTED_COLS]]
-                            df_combined.to_excel(not_applied_file, index=False)
-                        except Exception as e:
-                            self.logger.error(f"Error updating not_applied Excel file: {e}")
+                        job["Applied"] = False
+                        raw_reason = skip_reason or "Unknown failure"
+                        job["Skip Reason"] = raw_reason[:500] if len(raw_reason) > 500 else raw_reason
+                        self.logger.info(f"Skipped job '{job_title}': {raw_reason}")
+                        # Update skip stats bar
+                        if application_outcome.value in {"already_applied", "skipped"}:
+                            self._record_skipped_job(job)
+                        batch_not_applied.append(job.copy())
+                        flush_excel_batches()
                     
                 except Exception as e:
                     self.logger.error(f"Error applying to {job_title}: {e}")
                     failed_count += 1
+                    job["Applied"] = False
+                    job["Application Status"] = "failed"
+                    job["Skip Reason"] = f"Unhandled application error: {type(e).__name__}: {e}"[:500]
+                    batch_not_applied.append(job.copy())
+                    flush_excel_batches()
+                    try:
+                        from core.state_store import StateStore
+                        failure_state = StateStore()
+                        failure_job_key = str(job.get("Job URL", "") or job.get("URL", ""))
+                        failure_state.upsert_job(failure_job_key, "dice", job)
+                        failure_state.record_application_attempt(
+                            failure_job_key, "", "failed", job["Skip Reason"], ""
+                        )
+                        failure_state.close()
+                    except Exception as state_error:
+                        self.logger.error(f"Could not persist failed attempt: {state_error}")
                     # Update failed count
                     count_to_display = failed_count
                     self.root.after(0, lambda c=count_to_display: 
@@ -1659,6 +3178,8 @@ Dice Auto-Apply Bot Guide
                 pyautogui.moveRel(1, 1, duration=0.1)
                 pyautogui.moveRel(-1, -1, duration=0.1)
             
+            # Flush any remaining jobs in the batch buffers
+            flush_excel_batches(force=True)
             # ── Retry pass ────────────────────────────────────────────────────
             # Re-attempt jobs that failed due to transient issues (button timeout,
             # wizard timing out, click failures). Only ONE retry per job.
@@ -1674,6 +3195,7 @@ Dice Auto-Apply Bot Guide
                 job for job in jobs_to_apply
                 if not job.get("Applied", False)
                 and any(r in job.get("Skip Reason", "") for r in RETRYABLE_REASONS)
+                and not any(r['item_key'] == job.get('Job URL') and r['phase'] in {'external_action_started', 'needs_review'} for r in self._dice_recovery.unfinished('dice'))
             ]
 
             retry_success_count = 0
@@ -1693,18 +3215,89 @@ Dice Auto-Apply Bot Guide
                         break
                         
                     try:
+                        candidate_job_title = job.get("Job Title", "Unknown")
+                        driver._before_submit = lambda j=job: self._dice_checkpoint(j, 'external_action_started')
+                        driver._review_before_submit = self._review_dice_submission if self.review_before_submit else None
                         job_result = apply_to_job_url(
-                            driver, 
-                            job["Job URL"], 
+                            driver,
+                            job["Job URL"],
                             getattr(self, "resume_profiles", []),
-                            job_title=job_title,
+                            job_title=candidate_job_title,
                             semantic_matcher=self.semantic_matcher if self.semantic_enabled else None,
-                            learning_engine=self.learning_engine
+                            learning_engine=self.learning_engine,
+                            groq_scorer=getattr(self, 'groq_scorer', None),
+                            pause_check=self.check_pause,
+                            headless_mode=headless_mode,
+                            exclude_keywords=exclude_keywords,
+                            skill_gap_callback=self.record_skill_gap
                         )
                         applied_status, profile_name, match_reason, skip_reason, job_desc_text, profile_id = job_result
+                        retry_outcome = classify_application_outcome(applied_status, skip_reason).value
+                        job.update({'Application Status': retry_outcome, 'Applied': applied_status, 'Resume Profile': profile_name, 'Match Reason': match_reason, 'Skip Reason': skip_reason or ''})
+                        self._dice_recovery.record_application_attempt(str(job.get('Job URL', '')), self._dice_run, retry_outcome, skip_reason or '', str(profile_id or ''), export_record=dict(job), export_path='applied_jobs.xlsx' if applied_status else 'not_applied_jobs.xlsx')
+                        self._dice_checkpoint(job, 'confirmed' if retry_outcome in {'applied', 'already_applied', 'skipped'} else ('failed' if retry_outcome in {'failed', 'blocked'} else 'needs_review'))
+                        
+                        # Check if a skip was requested
+                        if self.skip_requested:
+                            self.logger.info(f"Job skipped by user during retry: {candidate_job_title}")
+                            self._record_skipped_job(job)
+                            self.skip_requested = False
+                            
+                            # Close popup tabs safely
+                            try:
+                                if len(driver.window_handles) > 1:
+                                    for handle in list(driver.window_handles)[1:]:
+                                        try:
+                                            driver.switch_to.window(handle)
+                                            driver.close()
+                                        except Exception:
+                                            pass
+                                driver.switch_to.window(driver.window_handles[0])
+                            except Exception as e:
+                                self.logger.error(f"Error restoring window handles after skip: {e}")
+                            
+                            # Log/update the not_applied row as skipped
+                            retry_fail_count += 1
+                            job["Skip Reason"] = "Skipped by user"
+                            try:
+                                EXPECTED_COLS = [
+                                    "Job Title", "Job URL", "Company", "Location",
+                                    "Employment Type", "Posted Date", "Applied",
+                                    "Resume Profile", "Match Reason", "Skip Reason"
+                                ]
+                                if os.path.exists(not_applied_file):
+                                    df_not = pd.read_excel(not_applied_file)
+                                    for col in EXPECTED_COLS:
+                                        if col not in df_not.columns:
+                                            df_not[col] = ""
+                                else:
+                                    df_not = pd.DataFrame(columns=EXPECTED_COLS)
+                                if job["Job URL"] in df_not["Job URL"].values:
+                                    df_not.loc[df_not["Job URL"] == job["Job URL"], "Skip Reason"] = "Skipped by user"
+                                else:
+                                    df_not = pd.concat([df_not, pd.DataFrame([job])], ignore_index=True)
+                                self.save_dataframe_to_excel_safely(df_not, not_applied_file)
+                            except Exception as xe:
+                                self.logger.error(f"Error updating not_applied_jobs on retry skip: {xe}")
+                            
+                            continue
+
+                        # Check if the driver session is still active/valid
+                        is_driver_active = True
+                        try:
+                            _ = driver.current_url
+                        except Exception:
+                            is_driver_active = False
+
+                        if not is_driver_active:
+                            self.logger.error("WebDriver session lost during retry. Stopping retry loop.")
+                            break
+
                         job["Applied"]        = applied_status
                         job["Resume Profile"] = profile_name
                         job["Match Reason"]   = match_reason
+                        
+                        self._log_match_details(profile_name, match_reason)
 
                         if applied_status:
                             retry_success_count += 1
@@ -1712,7 +3305,7 @@ Dice Auto-Apply Bot Guide
                             failed_count        -= 1
                             self.root.after(0, lambda c=applied_count: self.jobs_applied_label.config(text=str(c)))
                             self.root.after(0, lambda c=max(failed_count, 0): self.jobs_failed_label.config(text=str(c)))
-                            self.logger.info(f"  ✓ Retry succeeded: {job_title}")
+                            self.logger.info(f"  ✓ Retry succeeded: {candidate_job_title}")
                             # Write to applied_jobs
                             if skip_reason:
                                 job["Application Note"] = skip_reason
@@ -1726,19 +3319,21 @@ Dice Auto-Apply Bot Guide
                                         "Resume Profile", "Match Reason", "Application Note"
                                     ])
                                 df_combined = pd.concat([df_existing, pd.DataFrame([job])], ignore_index=True)
-                                df_combined.to_excel(applied_jobs_file, index=False)
+                                self.save_dataframe_to_excel_safely(df_combined, applied_jobs_file)
                             except Exception as xe:
                                 self.logger.error(f"Error updating applied_jobs on retry: {xe}")
                             # Remove from not_applied_jobs
                             try:
                                 df_not = pd.read_excel(not_applied_file)
                                 df_not = df_not[df_not["Job URL"] != job["Job URL"]]
-                                df_not.to_excel(not_applied_file, index=False)
+                                self.save_dataframe_to_excel_safely(df_not, not_applied_file)
                             except Exception:
                                 pass
                         else:
                             retry_fail_count += 1
-                            self.logger.info(f"  ✗ Retry failed: {job_title} | {skip_reason}")
+                            if classify_application_outcome(applied_status, skip_reason).value in {'already_applied', 'skipped'}:
+                                self._record_skipped_job(job)
+                            self.logger.info(f"  ✗ Retry failed: {candidate_job_title} | {skip_reason}")
                             job["Skip Reason"] = f"[Retry] {skip_reason[:460]}" if skip_reason else "[Retry] Unknown"
                             # Update the not_applied row in place
                             try:
@@ -1758,11 +3353,11 @@ Dice Auto-Apply Bot Guide
                                     df_not.loc[df_not["Job URL"] == job["Job URL"], "Skip Reason"] = job["Skip Reason"]
                                 else:
                                     df_not = pd.concat([df_not, pd.DataFrame([job])], ignore_index=True)
-                                df_not.to_excel(not_applied_file, index=False)
+                                self.save_dataframe_to_excel_safely(df_not, not_applied_file)
                             except Exception as xe:
                                 self.logger.error(f"Error updating not_applied_jobs on retry: {xe}")
                     except Exception as e:
-                        self.logger.error(f"Exception during retry of {job_title}: {e}")
+                        self.logger.error(f"Exception during retry of {candidate_job_title}: {e}")
                         retry_fail_count += 1
 
                 self.logger.info(f"Retry pass done: {retry_success_count} succeeded, {retry_fail_count} still failed.")
@@ -1799,7 +3394,7 @@ Dice Auto-Apply Bot Guide
                 
             # Show completion message
             self.root.after(0, lambda rs=retry_summary: messagebox.showinfo(
-                "Process Complete", 
+                "Process Complete",
                 f"Application process completed!\n\n"
                 f"Applied to {applied_count} jobs\n"
                 f"Failed for {failed_count} jobs\n"
@@ -1807,40 +3402,82 @@ Dice Auto-Apply Bot Guide
                 f"Total execution time: {time_str}"
             ))
             
-            # Clean up
-            driver.quit()
-                
         except Exception as e:
             self.logger.error(f"Error in job application process: {e}")
             self.update_status(f"Error: {str(e)}")
             self.root.after(0, lambda: messagebox.showerror(
-                "Error", 
+                "Error",
                 f"An error occurred: {str(e)}"
             ))
         finally:
+            # Restore OS power/sleep settings
+            allow_sleep()
+            if getattr(self, '_dice_recovery', None) is not None:
+                remaining = [r for r in self._dice_recovery.unfinished('dice') if r['run_id'] == self._dice_run]
+                self._dice_recovery.end_run(self._dice_run, 'interrupted' if remaining else 'completed')
+                self._dice_recovery.close()
+                self._dice_recovery = None
+            # Clean up webdriver if it exists
+            if getattr(self, 'driver', None) is not None:
+                try:
+                    self.driver.quit()
+                except Exception as qe:
+                    self.logger.error(f"Error quitting driver: {qe}")
+                self.driver = None
             # Reset UI
             self.reset_ui()
 
-
-            
     def stop_applying(self):
         """Stop the job application process"""
         if not self.running:
             return
             
+        allow_sleep()
         self.running = False
+        self.is_paused = False
         self.stop_button.config(state="disabled")
         self.pause_button.config(state="disabled", text="⏸  Pause")
-        self.is_paused = False
-        self.update_status("Application cycle complete.")
-        self.status_label.config(text="Stopping... Please wait.")
+        self.update_status("Stopping... Please wait.")
         self.logger.info("User requested to stop the application process")
         
+        # Instantly close browser to unblock the background thread
+        if getattr(self, 'driver', None) is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+        
+    def skip_job(self):
+        """Signal to skip the current job application"""
+        if self.running and not self.is_paused:
+            self.skip_requested = True
+            self.update_status("⏭  Skip requested — skipping current job...")
+            self.logger.info("Skip current job requested by user.")
+
+    def save_dataframe_to_excel_safely(self, df, filepath):
+        """Never overwrite a locked workbook or recommend rerunning applications."""
+        from utils.workbook_io import write_frame
+        try:
+            write_frame(df, filepath)
+            return True
+        except Exception as exc:
+            self.logger.error(f"Excel export pending for {filepath}: {exc}")
+            self.update_status('Excel export failed — close Excel. Application outcomes remain in the local ledger; do not resubmit jobs.')
+            return False
+
+
     def reset_ui(self):
         """Reset UI after job completion or stop"""
         self.running = False
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="normal", text="Stop")
+        self.is_paused = False
+        self.skip_requested = False
+        def _reset():
+            self.start_button.config(state="normal")
+            self.stop_button.config(state="disabled")
+            self.pause_button.config(state="disabled", text="⏸  Pause")
+            self.skip_button.config(state="disabled")
+        self.root.after(0, _reset)
         
     def setup_ai_trainer_tab(self):
         """Set up the UI for the AI Training tab"""
@@ -1867,13 +3504,21 @@ Dice Auto-Apply Bot Guide
         # Split into Left (Input) and Right (Stats)
         panes = ttk.Frame(container)
         panes.pack(fill="both", expand=True)
-        
+
         left_pane = ttk.Frame(panes)
         left_pane.pack(side="left", fill="both", expand=True, padx=(0, 20))
         
-        # Job Description Input
+        # --- Job Description Input ---
         ttk.Label(left_pane, text="Paste Job Description / Requirements:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
-        self.trainer_text = tk.Text(left_pane, height=15, font=("Consolas", 10), wrap="word", borderwidth=1, relief="solid")
+        
+        t = getattr(self, "_theme", {})
+        ENTRY_BG = t.get("ENTRY_BG", "#ffffff")
+        FG = t.get("FG", "#000000")
+        BORDER = t.get("BORDER", "#cccccc")
+
+        self.trainer_text = tk.Text(left_pane, height=15, font=("Consolas", 10), wrap="word", 
+                                    bg=ENTRY_BG, fg=FG, insertbackground=FG,
+                                    borderwidth=1, relief="solid", highlightbackground=BORDER)
         self.trainer_text.pack(fill="both", expand=True)
         
         # Controls (Profile select + Train button)
@@ -1941,20 +3586,35 @@ Dice Auto-Apply Bot Guide
         
         self.suggested_id = None
         
-        # Right Pane: Stats & Memory
-        right_pane = ttk.LabelFrame(panes, text=" AI Memory Status ", padding="15")
-        right_pane.pack(side="right", fill="both")
-        
-        self.stats_label = ttk.Label(right_pane, text="Lessons Learned by Profile:", font=("Segoe UI", 10, "bold"))
-        self.stats_label.pack(anchor="w", pady=(0, 10))
-        
-        self.stats_text = tk.Text(right_pane, height=12, width=35, font=("Segoe UI", 9), state="disabled", bg="#f8f9fa", borderwidth=0)
-        self.stats_text.pack(fill="both", expand=True)
-        
+        # Right Pane: Per-profile Training Cards
+        right_pane = ttk.LabelFrame(panes, text=" AI Memory — Per Profile ", padding="10")
+        right_pane.pack(side="right", fill="both", ipadx=5)
+
+        ttk.Label(right_pane, text="Training samples recorded per resume.",
+                  font=("Segoe UI", 9), foreground="#555").pack(anchor="w", pady=(0, 8))
+
+        # Scrollable canvas for cards
+        self._ai_cards_canvas = tk.Canvas(right_pane, width=300, highlightthickness=0, bg="#f0f4f8")
+        _vsb = ttk.Scrollbar(right_pane, orient="vertical", command=self._ai_cards_canvas.yview)
+        self._ai_cards_canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side="right", fill="y")
+        self._ai_cards_canvas.pack(side="left", fill="both", expand=True)
+
+        self._ai_cards_frame = ttk.Frame(self._ai_cards_canvas)
+        self._ai_cards_window = self._ai_cards_canvas.create_window(
+            (0, 0), window=self._ai_cards_frame, anchor="nw"
+        )
+        self._ai_cards_frame.bind(
+            "<Configure>",
+            lambda e: self._ai_cards_canvas.configure(
+                scrollregion=self._ai_cards_canvas.bbox("all")
+            )
+        )
+
         self.refresh_ai_stats()
-        
+
     def analyze_jd_for_training(self):
-        """Analyze the JD in the trainer text box and suggest a profile"""
+        """Analyze the JD in the trainer text box, evaluate LLM ATS fit score, and suggest profile"""
         jd = self.trainer_text.get("1.0", "end-1c").strip()
         if not jd:
             messagebox.showwarning("Empty", "Please paste a job description first.")
@@ -1964,54 +3624,85 @@ Dice Auto-Apply Bot Guide
             messagebox.showwarning("No Profiles", "Please add at least one resume profile first.")
             return
 
-        self.suggestion_var.set("✨ AI is thinking...")
+        self.suggestion_var.set("✨ AI is evaluating ATS fit & scoring profile...")
         self.confirm_frame.pack_forget()
         
-        # We'll use a temporary matcher to score the JD
         from core.matcher import ResumeMatcher
-        # If semantic matcher isn't ready, we'll just use keyword matching
-        matcher = ResumeMatcher(self.resume_profiles, semantic_matcher=self.semantic_matcher)
+        matcher = ResumeMatcher(
+            self.resume_profiles,
+            semantic_matcher=self.semantic_matcher,
+            learning_engine=self.learning_engine,
+            groq_scorer=self.groq_scorer
+        )
         
-        # Scoring logic (simplified titles for training focus)
-        results = []
         try:
-            # We try to find the best match using the matcher's logic
-            # For training purposes, we care about the holistic score
-            for p in self.resume_profiles:
-                # We'll do a quick score. In a real scenario we'd use semantic or keyword density.
-                # Here we'll just use the semantic matcher if available, or keyword overlap.
-                p_id = p.get('id')
-                score = 0
-                if self.semantic_matcher:
-                    # Holistic semantic check
-                    score_res = self.semantic_matcher.score_job("Training Sample", jd)
-                    for r in score_res:
-                        if r['profile_id'] == p_id:
-                            score = r['semantic_score']
-                            break
-                else:
-                    # Fallback to simple keyword density check
-                    text = jd.lower()
-                    kws = p.get('unique_keywords', []) + p.get('keywords', [])
-                    matches = sum(1 for kw in kws if kw.lower() in text)
-                    score = (matches / len(kws) * 100) if kws else 0
-                
-                results.append({'id': p_id, 'name': p.get('name'), 'score': score})
+            # Score all profiles against the pasted JD
+            selected_name = self.trainer_profile_var.get().strip()
+            ranked = matcher.score_profiles(
+                jd,
+                job_title="Target Role",
+                name_boost_mode=getattr(self, 'profile_name_boost_mode', 'off')
+            )
             
-            results.sort(key=lambda x: x['score'], reverse=True)
-            best = results[0]
+            if not ranked:
+                self.suggestion_var.set("✨ No matching keywords found in resume profiles.")
+                return
+
+            # Find best match or user-selected profile
+            best = ranked[0]
+            if selected_name:
+                user_p = next((r for r in ranked if r['name'] == selected_name), None)
+                if user_p:
+                    best = user_p
+
+            best_p = next((p for p in self.resume_profiles if p.get('name') == best['name']), None)
+            best_id = best_p.get('id') if best_p else best.get('id')
+
+            # LLM ATS Evaluation via Groq / Gemini
+            ats_score = best.get('groq_score', 0)
+            missing = best.get('groq_missing', [])
+            rec = best.get('groq_recommendation', '')
+
+            if self.groq_scorer and best_p and ats_score == 0:
+                all_kws = (best_p.get('unique_keywords') or []) + (best_p.get('keywords') or [])
+                eval_res = self.groq_scorer.score_fit(
+                    job_title="Target Job",
+                    job_description=jd,
+                    profile_name=best['name'],
+                    profile_keywords=all_kws,
+                    job_id="manual-trainer"
+                )
+                ats_score = eval_res.get('fit_score', 0)
+                missing = eval_res.get('missing_skills', [])
+                rec = eval_res.get('recommendation', '')
+
+            conf_pct = best.get('confidence_pct', 0.0)
+            display_score = ats_score if ats_score > 0 else conf_pct
+
+            status_msg = f"✨ Match: {best['name']} | ATS Score: {display_score}/100"
+            if missing:
+                status_msg += f" | Missing: {', '.join(missing[:3])}"
             
-            if best['score'] > 20: # Reasonable threshold
-                self.suggestion_var.set(f"✨ Match found: {best['name']} ({best['score']}%)")
-                self.suggested_id = best['id']
-                self.confirm_frame.pack(fill="x", pady=5)
-                # Auto-select in combo for convenience
-                self.trainer_profile_var.set(best['name'])
+            self.suggestion_var.set(status_msg)
+            self.suggested_id = best_id
+            self.trainer_profile_var.set(best['name'])
+            self.confirm_frame.pack(fill="x", pady=5)
+
+            # Show rich popup report to user
+            report = f"📊 ATS EVALUATION REPORT\n" \
+                     f"===================================\n" \
+                     f"📄 Target Resume: {best['name']}\n" \
+                     f"🎯 ATS Match Score: {display_score} / 100\n" \
+                     f"✅ Keyword Coverage: {best.get('coverage', 0)}%\n\n"
+            if missing:
+                report += f"⚠️ Critical Missing Skills:\n• " + "\n• ".join(missing) + "\n\n"
             else:
-                self.suggestion_var.set("✨ AI is unsure. Low confidence match.")
-                self.suggested_id = None
-                self.confirm_frame.pack_forget()
-                
+                report += f"✅ Skill Gaps: None detected!\n\n"
+            if rec:
+                report += f"💡 AI Recruiter Summary:\n\"{rec}\"\n"
+
+            messagebox.showinfo("ATS Resume Evaluation", report)
+
         except Exception as e:
             self.logger.error(f"Analysis failed: {e}")
             self.suggestion_var.set("✨ AI Analysis failed.")
@@ -2046,39 +3737,978 @@ Dice Auto-Apply Bot Guide
         if names and not self.trainer_profile_var.get():
              self.trainer_profile_combo.current(0)
              
+        self._sync_kw_profiles()
+
+    def _sync_kw_profiles(self):
+        """Updates the dropdown in the Groq Scanner tab with current resume profiles"""
+        if not hasattr(self, 'kw_profile_combo'): return
+        
+        names = [p.get('name', 'Unknown') for p in self.resume_profiles]
+        self.kw_profile_combo['values'] = names
+        if names and not self.kw_profile_var.get():
+             self.kw_profile_combo.current(0)
+             
     def refresh_ai_stats(self):
-        """Update the statistics box in the AI trainer tab"""
-        if not hasattr(self, 'stats_text'): return
+        """Rebuild per-profile training cards in the AI trainer right pane."""
+        if not hasattr(self, '_ai_cards_frame'):
+            return
+
+        # Destroy existing cards
+        for widget in self._ai_cards_frame.winfo_children():
+            widget.destroy()
+
+        stats  = self.learning_engine.get_stats()
+        t      = getattr(self, '_theme', {})
+        BG     = t.get('PANEL', '#ffffff')
+        BORDER = t.get('BORDER', '#334155')
+
+        if not self.resume_profiles:
+            ttk.Label(self._ai_cards_frame,
+                      text="No resume profiles configured.",
+                      font=("Segoe UI", 9), foreground="#888").pack(pady=20)
+            return
+
+        for p in self.resume_profiles:
+            p_id   = p.get('id')
+            p_name = p.get('name', 'Unknown')
+            p_stats = stats.get(p_id, {'manual': 0, 'auto': 0})
+            m_count = p_stats.get('manual', 0)
+            a_count = p_stats.get('auto',   0)
+            total   = m_count + a_count
+
+            status_icon  = "⭐" if total >= 5 else ("🌱" if total > 0 else "⬜")
+            status_color = "#4ade80" if total >= 5 else ("#fbbf24" if total > 0 else "#94a3b8")
+
+            # Card frame — use a slightly lighter panel shade so it pops against canvas
+            card = tk.Frame(
+                self._ai_cards_frame,
+                bg="#1e293b", bd=0,
+                highlightthickness=1,
+                highlightbackground="#334155"
+            )
+            card.pack(fill="x", padx=6, pady=5, ipady=6)
+
+            # Top row: icon + profile name (white text so it's always visible)
+            top = tk.Frame(card, bg="#1e293b")
+            top.pack(fill="x", padx=8, pady=(6, 2))
+            tk.Label(top, text=status_icon, bg="#1e293b",
+                     font=("Segoe UI", 13)).pack(side="left")
+            tk.Label(top, text=p_name, bg="#1e293b",
+                     font=("Segoe UI", 9, "bold"),
+                     fg="#f1f5f9", wraplength=220, justify="left").pack(side="left", padx=6)
+
+            # Middle row: sample counts
+            mid = tk.Frame(card, bg="#1e293b")
+            mid.pack(fill="x", padx=14, pady=2)
+            count_text = f"{total} sample(s)  ·  {m_count} manual  ·  {a_count} auto"
+            tk.Label(mid, text=count_text, bg="#1e293b",
+                     font=("Segoe UI", 8), fg=status_color).pack(side="left")
+
+            # Bottom row: Reset button (only if there IS training data)
+            if total > 0:
+                bot = tk.Frame(card, bg="#1e293b")
+                bot.pack(fill="x", padx=8, pady=(4, 6))
+
+                def _make_reset(pid, pname):
+                    def _reset():
+                        ans = messagebox.askyesno(
+                            "Reset Training Data",
+                            f"Delete ALL {total} training sample(s) for:\n\n  '{pname}'\n\n"
+                            "This cannot be undone. The AI will start fresh for this profile."
+                        )
+                        if ans:
+                            self.learning_engine.delete_profile_history(pid)
+                            self.refresh_ai_stats()
+                            messagebox.showinfo(
+                                "Done",
+                                f"Training data for '{pname}' has been cleared.\n"
+                                "You can now retrain this profile from scratch."
+                            )
+                    return _reset
+
+                reset_btn = tk.Button(
+                    bot,
+                    text="  Reset Training  ",
+                    command=_make_reset(p_id, p_name),
+                    bg="#dc2626", fg="white",
+                    font=("Segoe UI", 8, "bold"),
+                    relief="flat", cursor="hand2",
+                    activebackground="#b91c1c", activeforeground="white",
+                    padx=8, pady=3
+                )
+                reset_btn.pack(side="left")
+
+        # Update canvas scroll region after rebuilding
+        self._ai_cards_frame.update_idletasks()
+        self._ai_cards_canvas.configure(
+            scrollregion=self._ai_cards_canvas.bbox("all")
+        )
+
+    def _run_auto_scan_if_needed(self, force: bool = False):
+        """Silently scans top 5 resumes in the background if 7 days have passed (or force=True)."""
+        import datetime
+        if not force:
+            try:
+                last_run_str = getattr(self, 'last_auto_scan_timestamp', '')
+                if last_run_str:
+                    last_run = datetime.datetime.fromisoformat(last_run_str)
+                    if (datetime.datetime.now() - last_run).days < 7:
+                        return # Less than 7 days have passed
+            except Exception:
+                pass # Invalid or empty date format, run it now
+
+        if not getattr(self, 'groq_scorer', None):
+            return
+
+        def _bg_scan():
+            from core.resume_keyword_scanner import ResumeKeywordScanner
+            from core.matcher import ResumeMatcher
+            import re
+
+            self.logger.info("[Auto-Scan] Starting weekly keyword extraction for up to 5 profiles...")
+            scanner = ResumeKeywordScanner(self.groq_scorer)
+            profiles_scanned = 0
+            keywords_added = 0
+
+            # Scan up to 5 profiles to save tokens
+            for profile in self.resume_profiles[:5]:
+                try:
+                    file_path = profile.get('file_path', '')
+                    if not file_path or not os.path.exists(file_path):
+                        continue
+
+                    # Call Groq API
+                    res_kws = scanner.scan_resume(file_path)
+                    
+                    # Compute gaps manually here to avoid UI coupling
+                    def _norm(lst): return {k.lower(): k for k in lst}
+                    res_unique = _norm(res_kws.get("unique", []))
+                    res_general = _norm(res_kws.get("general", []))
+                    res_all = {**res_general, **res_unique}
+                    
+                    prof_unique = profile.get("unique_keywords", [])
+                    prof_general = profile.get("keywords", [])
+                    
+                    prof_all_regex = []
+                    for kw in prof_unique + prof_general:
+                        pat = ResumeMatcher.build_keyword_pattern(kw)
+                        if pat: prof_all_regex.append(re.compile(pat, re.IGNORECASE))
+                        
+                    def _is_in_profile(kw):
+                        for pat in prof_all_regex:
+                            if pat.search(kw): return True
+                        return False
+
+                    added_unique = []
+                    added_general = []
+                    for key, original in res_all.items():
+                        if not _is_in_profile(key):
+                            if key in res_unique: added_unique.append(original)
+                            else: added_general.append(original)
+
+                    if added_unique or added_general:
+                        self._save_keyword_suggestions(profile, added_unique + added_general, 'Scheduled résumé scan')
+                        keywords_added += len(added_unique) + len(added_general)
+                    
+                    profiles_scanned += 1
+                except Exception as e:
+                    self.logger.error(f"[Auto-Scan] Error scanning {profile.get('name')}: {e}")
+
+            # Update timestamp and save
+            self.last_auto_scan_timestamp = datetime.datetime.now().isoformat()
+            self.root.after(0, self.save_config)
+            
+            if keywords_added > 0:
+                self.logger.info(f"[Auto-Scan] Complete. Saved suggestions across {profiles_scanned} profiles. Profiles unchanged.")
+                from tkinter import messagebox
+                self.root.after(0, lambda: messagebox.showinfo("Auto-Scan Complete", f"Found {keywords_added} keyword suggestions. View Keyword Suggestions; profiles are unchanged."))
         
-        stats = self.learning_engine.get_stats()
+        import threading
+        threading.Thread(target=_bg_scan, daemon=True).start()
+
+    def setup_groq_scanner_tab(self):
+        """Set up the UI for the Groq & AI Key Manager tab"""
+        container = ttk.Frame(self.groq_scanner_tab, padding="20")
+        container.pack(fill="both", expand=True)
         
-        self.stats_text.config(state="normal")
-        self.stats_text.delete("1.0", tk.END)
+        # Header
+        header_lbl = ttk.Label(
+            container, 
+            text="🤖 Groq & AI Keyword Discovery Engine", 
+            font=("Segoe UI", 16, "bold"),
+            foreground="#93c5fd"
+        )
+        header_lbl.pack(anchor="w", pady=(0, 5))
         
-        if not stats:
-            self.stats_text.insert("end", "AI is currently a blank slate.\nStart training to see progress!")
-        else:
-            for p in self.resume_profiles:
-                p_id = p.get('id')
-                p_name = p.get('name', 'Unknown')
+        desc_lbl = ttk.Label(
+            container,
+            text="Manage LLM API keys with randomized load balancing, extract missing tech keywords, and monitor Groq/Gemini inference activity.",
+            font=("Segoe UI", 10),
+            foreground="#9aa3c2"
+        )
+        desc_lbl.pack(anchor="w", pady=(0, 15))
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Universal API Key Manager & Key Rotation Strategy
+        # ─────────────────────────────────────────────────────────────────────
+        api_mgr_frame = ttk.LabelFrame(container, text=" 🔑 API Key Manager & Load Balancer ", padding="10")
+        api_mgr_frame.pack(fill="x", pady=(0, 15))
+        api_mgr_frame.columnconfigure(0, weight=1)
+
+        PROVIDER_ICONS = {
+            "Groq":      "⚡",
+            "Gemini":    "✨",
+            "OpenAI":    "🤖",
+            "Anthropic": "🧠",
+            "Apify":     "🕷",
+            "Custom":    "🔧",
+        }
+        PROVIDERS = list(PROVIDER_ICONS.keys())
+
+        # ── Treeview table ─────────────────────────────────────────────────
+        tree_frame = ttk.Frame(api_mgr_frame)
+        tree_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=(5, 6))
+        tree_frame.columnconfigure(0, weight=1)
+
+        cols = ("provider", "name", "key_masked")
+        self.api_key_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=4, selectmode="browse")
+        self.api_key_tree.heading("provider", text="Provider")
+        self.api_key_tree.heading("name",     text="Key Name")
+        self.api_key_tree.heading("key_masked", text="API Key (Masked)")
+        self.api_key_tree.column("provider",   width=110, anchor="center")
+        self.api_key_tree.column("name",       width=160, anchor="w")
+        self.api_key_tree.column("key_masked", width=250, anchor="w")
+
+        tree_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.api_key_tree.yview)
+        self.api_key_tree.configure(yscrollcommand=tree_sb.set)
+        self.api_key_tree.grid(row=0, column=0, sticky="ew")
+        tree_sb.grid(row=0, column=1, sticky="ns")
+
+        def _mask(key):
+            """Show first 8 chars then ****"""
+            key = key.strip()
+            if len(key) > 8:
+                return f"{key[:8]}...{'*' * 8}"
+            return "*" * len(key)
+
+        def _refresh_tree():
+            for item in self.api_key_tree.get_children():
+                self.api_key_tree.delete(item)
+            for idx, entry in enumerate(getattr(self, 'api_keys_list', [])):
+                if isinstance(entry, str):
+                    prov = "Groq" if entry.startswith("gsk_") else ("Gemini" if entry.startswith("AIza") else "Custom")
+                    entry = {"provider": prov, "name": f"Key {idx+1}", "key": entry}
+                elif not isinstance(entry, dict):
+                    continue
+                icon = PROVIDER_ICONS.get(entry.get('provider', 'Custom'), "🔧")
+                self.api_key_tree.insert("", "end", iid=str(idx), values=(
+                    f"{icon}  {entry.get('provider', 'Custom')}",
+                    entry.get('name', ''),
+                    _mask(entry.get('key', ''))
+                ))
+
+        _refresh_tree()
+
+        # ── Input row ─────────────────────────────────────────────────────
+        input_frame = ttk.Frame(api_mgr_frame)
+        input_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+        for c in range(5): input_frame.columnconfigure(c, weight=(1 if c in (1, 3) else 0))
+
+        ttk.Label(input_frame, text="Provider:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        _provider_var = tk.StringVar(value="Groq")
+        provider_cb = ttk.Combobox(input_frame, textvariable=_provider_var,
+                                   values=PROVIDERS, state="readonly", width=12)
+        provider_cb.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+
+        ttk.Label(input_frame, text="Name:").grid(row=0, column=2, sticky="w", padx=(0, 4))
+        _name_var = tk.StringVar()
+        ttk.Entry(input_frame, textvariable=_name_var, width=18).grid(row=0, column=3, sticky="ew", padx=(0, 10))
+
+        ttk.Label(input_frame, text="API Key:").grid(row=0, column=4, sticky="w", padx=(0, 4))
+        _key_var = tk.StringVar()
+        _key_entry = ttk.Entry(input_frame, textvariable=_key_var, show="*", width=30)
+        _key_entry.grid(row=0, column=5, sticky="ew", padx=(0, 8))
+        input_frame.columnconfigure(5, weight=2)
+
+        def _sync_scorer_keys():
+            _keys_list = getattr(self, 'api_keys_list', [])
+            _llm_keys = [entry['key'].strip() for entry in _keys_list
+                         if str(entry.get('provider', '')).lower() == 'groq' and entry.get('key', '').strip()]
+            _llm_keys = _llm_keys[:1]
+            rot_mode = getattr(self, 'key_rotation_mode', 'random')
+            if getattr(self, 'groq_scorer', None):
+                self.groq_scorer.update_keys(_llm_keys, key_mode=rot_mode)
+
+        def _add_key():
+            provider = _provider_var.get().strip()
+            name     = _name_var.get().strip()
+            key      = _key_var.get().strip()
+            if not key:
+                messagebox.showwarning("Missing Key", "Please enter an API key before adding.")
+                return
+            if not name:
+                existing = [e for e in getattr(self, 'api_keys_list', []) if e.get('provider') == provider]
+                name = f"{provider} Key {len(existing) + 1}"
+            entry = {'provider': provider, 'name': name, 'key': key}
+            if not hasattr(self, 'api_keys_list') or self.api_keys_list is None:
+                self.api_keys_list = []
+            if provider.lower() == 'groq':
+                self.api_keys_list = [e for e in self.api_keys_list
+                                      if str(e.get('provider', '')).lower() != 'groq']
+                self._groq_key_dirty = True
+            self.api_keys_list.append(entry)
+            _refresh_tree()
+            _name_var.set("")
+            _key_var.set("")
+            _sync_scorer_keys()
+            self._persist_config()
+
+        def _remove_key():
+            sel = self.api_key_tree.selection()
+            if not sel:
+                messagebox.showwarning("No Selection", "Please click a key in the table to select it first.")
+                return
+            idx = int(sel[0])
+            entry = self.api_keys_list[idx]
+            if messagebox.askyesno("Remove Key", f"Remove '{entry.get('name', 'this key')}'?"):
+                self.api_keys_list.pop(idx)
+                if str(entry.get('provider', '')).lower() == 'groq':
+                    self._groq_key_dirty = True
+                _refresh_tree()
+                _sync_scorer_keys()
+                self._persist_config()
+
+        # ── Action & Rotation Control Row ─────────────────────────────────
+        btn_frame = ttk.Frame(api_mgr_frame)
+        btn_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=(0, 5))
+
+        ttk.Button(btn_frame, text="✅ Save & Add Key", command=_add_key, style="Start.TButton").pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="🗑 Remove Selected", command=_remove_key).pack(side="left", padx=(0, 15))
+
+        ttk.Label(btn_frame, text="🎲 Key Rotation Mode:").pack(side="left", padx=(10, 4))
+        ROT_MAP = {
+            "🎲 Randomize (Distributed Load)": "random",
+            "🔄 Round-Robin (Sequential)": "round_robin",
+            "1️⃣ Primary Key First": "primary"
+        }
+        INV_ROT_MAP = {v: k for k, v in ROT_MAP.items()}
+        curr_mode = getattr(self, 'key_rotation_mode', 'random')
+        rot_var = tk.StringVar(value=INV_ROT_MAP.get(curr_mode, "🎲 Randomize (Distributed Load)"))
+
+        def _on_rot_change(event=None):
+            mode_str = ROT_MAP.get(rot_var.get(), "random")
+            self.key_rotation_mode = mode_str
+            if getattr(self, 'groq_scorer', None):
+                self.groq_scorer.key_mode = mode_str
+            self._persist_config()
+
+        rot_combo = ttk.Combobox(btn_frame, textvariable=rot_var, values=list(ROT_MAP.keys()), state="readonly", width=30)
+        rot_combo.pack(side="left")
+        rot_combo.bind("<<ComboboxSelected>>", _on_rot_change)
+
+        ttk.Label(api_mgr_frame,
+                  text="💡 Groq & Gemini keys are automatically randomized per inference call to distribute quota and prevent 429 rate limits!",
+                  foreground="#9aa3c2", font=("Segoe UI", 8, "italic")
+                  ).grid(row=3, column=0, sticky="w", padx=5, pady=(4, 2))
+
+        # Split into Left (Scanner) and Right (Stats)
+        panes = ttk.Frame(container)
+        panes.pack(fill="both", expand=True)
+        
+        left_pane = ttk.Frame(panes)
+        left_pane.pack(side="left", fill="both", expand=True, padx=(0, 15))
+        
+        # --- Keyword Discovery Section ---
+        kw_discovery_frame = ttk.LabelFrame(left_pane, text=" Keyword Discovery & Skill Gaps ", padding="10")
+        kw_discovery_frame.pack(fill="x", pady=(0, 15))
+        
+        ttk.Label(kw_discovery_frame, text="Scan resume files with Groq/Gemini to find missing technical skills and update your profiles.").pack(anchor="w")
+        
+        kw_row = ttk.Frame(kw_discovery_frame)
+        kw_row.pack(fill="x", pady=8)
+        
+        ttk.Label(kw_row, text="Target Profile:").pack(side="left", padx=(0, 5))
+        self.kw_profile_var = tk.StringVar()
+        self.kw_profile_combo = ttk.Combobox(kw_row, textvariable=self.kw_profile_var, state="readonly", width=25)
+        self.kw_profile_combo.pack(side="left", padx=(0, 12))
+
+        self.kw_results_var = tk.StringVar(value="")
+        kw_result_lbl = ttk.Label(kw_discovery_frame, textvariable=self.kw_results_var, font=("Segoe UI", 9, "bold"))
+        kw_result_lbl.pack(anchor="w", pady=(5,0))
+        
+        self.kw_missing_text = tk.Text(kw_discovery_frame, height=7, font=("Consolas", 10), wrap="word", bg="#f8d7da", fg="#721c24", state="disabled")
+        
+        # Define member buttons BEFORE inner functions to guarantee clean scoping
+        def _view_raw_scan():
+            if not hasattr(self, '_last_raw_scan') or not self._last_raw_scan:
+                return
+            top = tk.Toplevel(self.root)
+            top.title("Raw Groq Scan Results")
+            top.geometry("500x600")
+            
+            txt = tk.Text(top, font=("Segoe UI", 10), wrap="word")
+            txt.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            txt.insert("end", "--- UNIQUE / SPECIALIZED KEYWORDS ---\n")
+            for k in self._last_raw_scan.get("unique", []):
+                txt.insert("end", f"• {k}\n")
                 
-                # Get the breakdown from the dict structure returned by LearningEngine
-                p_stats = stats.get(p_id, {'manual': 0, 'auto': 0})
-                m_count = p_stats['manual']
-                a_count = p_stats['auto']
-                total   = m_count + a_count
+            txt.insert("end", "\n--- GENERAL KEYWORDS ---\n")
+            for k in self._last_raw_scan.get("general", []):
+                txt.insert("end", f"• {k}\n")
                 
-                icon = "⭐" if total >= 5 else "🌱"
-                # Show breakdown: Profile Name ... Total (M manual, A auto)
-                display_str = f"{icon} {p_name:.<20} {total} ({m_count}m, {a_count}a)\n"
-                self.stats_text.insert("end", display_str)
+            txt.config(state="disabled")
+
+        def _add_gaps():
+            if not hasattr(self, '_current_gaps') or not hasattr(self, '_current_kw_profile'):
+                return
+                
+            p_dict = self._current_kw_profile
+            gaps = self._current_gaps
+            
+            self._save_keyword_suggestions(p_dict, gaps['unique'] + gaps['general'])
+            self.kw_results_var.set("Suggestions saved. Profiles unchanged.")
+            self.kw_missing_text.pack_forget()
+            if hasattr(self, 'kw_add_btn'): self.kw_add_btn.pack_forget()
+            messagebox.showinfo("Suggestions saved", "Open Keyword Suggestions to review. Edit profile keywords manually after verification.")
+
+        self.kw_view_btn = ttk.Button(kw_row, text="👀 View Raw Scan", command=_view_raw_scan)
+        self.kw_add_btn  = ttk.Button(kw_discovery_frame, text="Save Keyword Suggestions", command=_add_gaps, style="Start.TButton")
+
+        def _on_scan_resume():
+            p_name = self.kw_profile_var.get()
+            if not p_name:
+                messagebox.showwarning("Incomplete", "Please select a target profile first.")
+                return
+            
+            profile = next((p for p in self.resume_profiles if p.get('name') == p_name), None)
+            if not profile or not profile.get('file_path'):
+                messagebox.showerror("Error", "Could not find profile or resume file path.")
+                return
+                
+            self.kw_results_var.set("🚀 Hitting Groq API for keyword discovery... Please wait.")
+            self.kw_missing_text.pack_forget()
+            if hasattr(self, 'kw_add_btn'): self.kw_add_btn.pack_forget()
+            self.root.update()
+            
+            import threading
+            def _scan():
+                try:
+                    from core.resume_keyword_scanner import ResumeKeywordScanner
+                    scanner = ResumeKeywordScanner(getattr(self, 'groq_scorer', None))
+                    res_kws = scanner.scan_resume(profile['file_path'])
+                    
+                    def _norm(lst): return {k.lower(): k for k in lst}
+                    res_unique = _norm(res_kws.get("unique", []))
+                    res_general = _norm(res_kws.get("general", []))
+                    res_all = {**res_general, **res_unique}
+                    
+                    prof_unique = profile.get("unique_keywords", [])
+                    prof_general = profile.get("keywords", [])
+                    
+                    import re
+                    from core.matcher import ResumeMatcher
+                    prof_all_regex = []
+                    for kw in prof_unique + prof_general:
+                        pat = ResumeMatcher.build_keyword_pattern(kw)
+                        if pat: prof_all_regex.append(re.compile(pat, re.IGNORECASE))
+                        
+                    def _is_in_profile(kw):
+                        for pat in prof_all_regex:
+                            if pat.search(kw): return True
+                        return False
+                        
+                    gaps = {"unique": [], "general": []}
+                    for key, original in res_all.items():
+                        if not _is_in_profile(key):
+                            if key in res_unique: gaps["unique"].append(original)
+                            else: gaps["general"].append(original)
+                            
+                    self.root.after(0, lambda: _show_gaps(res_all, gaps, profile, res_kws))
+                except Exception as e:
+                    err_msg = str(e)
+                    self.root.after(0, lambda m=err_msg: self.kw_results_var.set(f"Error: {m}"))
+                    
+            threading.Thread(target=_scan, daemon=True).start()
+
+        def _show_gaps(res_all, gaps, profile, res_kws):
+            self._save_keyword_suggestions(profile, gaps['unique'] + gaps['general'])
+            total_missing = len(gaps["unique"]) + len(gaps["general"])
+            self.kw_results_var.set(f"Found {len(res_all)} keywords in resume. {total_missing} missing from profile.")
+            
+            self._last_raw_scan = res_kws
+            self.kw_view_btn.pack(side="left", padx=(5, 0))
+            
+            if total_missing > 0:
+                self.kw_missing_text.config(state="normal")
+                self.kw_missing_text.delete("1.0", tk.END)
+                all_gaps = gaps["unique"] + gaps["general"]
+                self.kw_missing_text.insert(tk.END, ", ".join(all_gaps))
+                self.kw_missing_text.config(state="disabled")
+                self.kw_missing_text.pack(fill="x", pady=5)
+                
+                self._current_gaps = gaps
+                self._current_kw_profile = profile
+                self.kw_add_btn.pack(side="right", pady=4)
+
+        def _on_scan_all_resumes():
+            """Scan resumes into a separate suggestion notebook; never edit profiles."""
+            if not self.resume_profiles:
+                messagebox.showwarning("No Profiles", "No resume profiles configured.")
+                return
+            if not getattr(self, 'groq_scorer', None):
+                messagebox.showerror("No API Key", "Groq/Gemini API key is not configured. Please add an API key above.")
+                return
+            if not messagebox.askyesno("Scan All Resumes",
+                f"Scan all {len(self.resume_profiles)} resumes and save keyword suggestions separately? Profiles will not change."):
+                return
+
+            self.kw_results_var.set(f"Scanning all {len(self.resume_profiles)} resumes... Please wait.")
+            self.kw_missing_text.pack_forget()
+            if hasattr(self, 'kw_add_btn'): self.kw_add_btn.pack_forget()
+            self.root.update()
+
+            def _scan_all():
+                from core.resume_keyword_scanner import ResumeKeywordScanner
+                from core.matcher import ResumeMatcher
+                import re as _re
+
+                scanner = ResumeKeywordScanner(self.groq_scorer)
+                total_added = 0
+                scanned = 0
+                errors = 0
+
+                scan_details = []
+                for idx, profile in enumerate(self.resume_profiles):
+                    p_name = profile.get('name', f'Profile {idx+1}')
+                    file_path = profile.get('file_path', '')
+                    self.root.after(0, lambda n=p_name, i=idx:
+                        self.kw_results_var.set(f"Scanning {i+1}/{len(self.resume_profiles)}: {n}..."))
+
+                    if not file_path or not os.path.exists(file_path):
+                        reason = "Path empty" if not file_path else f"File not found: {file_path}"
+                        self.logger.warning(f"[Scan All] Skipping {p_name} — {reason}")
+                        errors += 1
+                        scan_details.append({
+                            "name": p_name,
+                            "status": "error",
+                            "reason": reason,
+                            "unique": [],
+                            "general": []
+                        })
+                        continue
+
+                    try:
+                        res_kws = scanner.scan_resume(file_path)
+
+                        def _norm(lst): return {k.lower(): k for k in lst}
+                        res_unique = _norm(res_kws.get("unique", []))
+                        res_general = _norm(res_kws.get("general", []))
+                        res_all = {**res_general, **res_unique}
+
+                        prof_unique = profile.get("unique_keywords", [])
+                        prof_general = profile.get("keywords", [])
+
+                        prof_all_regex = []
+                        for kw in prof_unique + prof_general:
+                            pat = ResumeMatcher.build_keyword_pattern(kw)
+                            if pat: prof_all_regex.append(_re.compile(pat, _re.IGNORECASE))
+
+                        def _is_in_profile(kw, _regexes=prof_all_regex):
+                            for pat in _regexes:
+                                if pat.search(kw): return True
+                            return False
+
+                        added_unique, added_general = [], []
+                        for key, original in res_all.items():
+                            if not _is_in_profile(key):
+                                if key in res_unique: added_unique.append(original)
+                                else: added_general.append(original)
+
+                        if added_unique or added_general:
+                            self._save_keyword_suggestions(profile, added_unique + added_general, 'Scan all résumés')
+                            total_added += len(added_unique) + len(added_general)
+                            scan_details.append({
+                                "name": p_name,
+                                "status": "added",
+                                "reason": f"Saved {len(added_unique) + len(added_general)} suggestions; profile unchanged",
+                                "unique": added_unique,
+                                "general": added_general
+                            })
+                        else:
+                            scan_details.append({
+                                "name": p_name,
+                                "status": "up_to_date",
+                                "reason": "Already up to date (0 missing keywords)",
+                                "unique": [],
+                                "general": []
+                            })
+
+                        scanned += 1
+                        self.logger.info(f"[Scan All] {p_name}: +{len(added_unique)} unique, +{len(added_general)} general keywords.")
+
+                    except Exception as e:
+                        err_str = str(e)
+                        self.logger.error(f"[Scan All] Error scanning {p_name}: {err_str}")
+                        errors += 1
+                        scan_details.append({
+                            "name": p_name,
+                            "status": "error",
+                            "reason": f"Groq Scan Error: {err_str}",
+                            "unique": [],
+                            "general": []
+                        })
+
+                # Save once after all profiles updated
+                self.root.after(0, self.save_config)
+
+                def _done():
+                    msg = f"Scan All complete: {scanned}/{len(self.resume_profiles)} profiles scanned, {total_added} suggestions found. Profiles unchanged."
+                    if errors:
+                        msg += f" ({errors} skipped/errored)"
+                    self.kw_results_var.set(msg)
+                    self._show_scan_all_results_modal(scan_details)
+
+                self.root.after(0, _done)
+
+            threading.Thread(target=_scan_all, daemon=True).start()
+
+        # Action Buttons in Discovery Row — PROMINENT & CLEAR
+        kw_scan_btn = ttk.Button(kw_row, text="📄 Scan Selected Profile", command=_on_scan_resume, style="Blue.TButton")
+        kw_scan_btn.pack(side="left", padx=(0, 6))
+
+        self.kw_scan_all_btn = ttk.Button(kw_row, text="📋 Scan All Resumes", command=_on_scan_all_resumes, style="Amber.TButton")
+        self.kw_scan_all_btn.pack(side="left", padx=(0, 6))
+
+        # --- Silent Auto Scan Section ---
+        auto_scan_frame = tk.Frame(kw_discovery_frame, bg="#1e293b", bd=1, relief="groove")
+        auto_scan_frame.pack(fill="x", pady=(12, 0), ipady=4)
         
-        self.stats_text.config(state="disabled")
+        self.auto_scan_var = tk.BooleanVar(value=getattr(self, 'auto_scan_enabled', False))
+        auto_scan_chk = ToggleSwitch(
+            auto_scan_frame, 
+            variable=self.auto_scan_var,
+            command=self._persist_config,
+            bg="#1e293b"
+        )
+        auto_scan_chk.pack(side="left", padx=8)
+        ttk.Label(auto_scan_frame, text="Save suggestions from weekly scans (top 5 résumés; never edits profiles)").pack(side="left", padx=(4,0))
+
+        run_auto_now_btn = ttk.Button(
+            auto_scan_frame,
+            text="⚡ Run Silent Scan Now",
+            command=lambda: self._run_auto_scan_if_needed(force=True),
+            style="Blue.TButton"
+        )
+        run_auto_now_btn.pack(side="right", padx=10)
+
+        # Initial sync for the profile dropdown
+        self._sync_kw_profiles()
+
+        # Right Pane: Groq API Usage Dashboard
+        right_pane = ttk.LabelFrame(panes, text=" Groq & LLM Inference Dashboard ", padding="15")
+        right_pane.pack(side="right", fill="both", ipadx=5)
+
+        ttk.Label(right_pane, text="Track Groq & Gemini model inference activity.",
+                  font=("Segoe UI", 9), foreground="#9aa3c2").pack(anchor="w", pady=(0, 12))
+
+        stats_frame = tk.Frame(right_pane, bg="#1e293b", bd=2, relief="groove")
+        stats_frame.pack(fill="x", expand=False)
+        
+        def _stat_row(parent, label_text, val_text, color="#e2e8f0"):
+            row = tk.Frame(parent, bg="#1e293b")
+            row.pack(fill="x", pady=4, padx=10)
+            tk.Label(row, text=label_text, font=("Segoe UI", 10, "bold"), bg="#1e293b", fg="#94a3b8").pack(side="left")
+            val_lbl = tk.Label(row, text=val_text, font=("Consolas", 11, "bold"), bg="#1e293b", fg=color)
+            val_lbl.pack(side="right")
+            return val_lbl
+
+        self.lbl_groq_status = _stat_row(stats_frame, "API Status:", "🟢 Online", "#4ade80")
+        
+        raw_key = ""
+        if getattr(self, 'groq_scorer', None) and hasattr(self.groq_scorer, '_api_keys') and self.groq_scorer._api_keys:
+            raw_key = self.groq_scorer._api_keys[self.groq_scorer._current_key_idx % len(self.groq_scorer._api_keys)]
+        masked = f"{raw_key[:8]}...****" if raw_key else "Not Configured"
+        self.lbl_active_key = _stat_row(stats_frame, "Active API Key:", masked, "#fbbf24")
+
+        total_keys_cnt = len(getattr(self, 'api_keys_list', []))
+        self.lbl_key_cnt = _stat_row(stats_frame, "Registered API Keys:", str(total_keys_cnt), "#a78bfa")
+        self.lbl_rot_mode = _stat_row(stats_frame, "Rotation Strategy:", getattr(self, 'key_rotation_mode', 'random').upper(), "#38bdf8")
+        
+        tk.Frame(stats_frame, height=1, bg="#334155").pack(fill="x", pady=8, padx=10)
+        
+        self.lbl_groq_calls = _stat_row(stats_frame, "Total API Calls:", "0", "#60a5fa")
+        self.lbl_groq_saved = _stat_row(stats_frame, "Saved via Cache:", "0", "#34d399")
+        self.lbl_groq_last  = _stat_row(stats_frame, "Last Call Time:", "Never", "#cbd5e1")
+        
+        def _refresh_stats():
+            if hasattr(self, 'groq_scorer') and self.groq_scorer:
+                from core.groq_resume_scorer import GroqResumeScorer
+                stats = GroqResumeScorer.get_stats()
+                self.lbl_groq_calls.config(text=str(stats.get('total', 0)))
+                self.lbl_groq_saved.config(text=f"{stats.get('cached', 0)} calls prevented")
+                self.lbl_groq_last.config(text=stats.get('last_time', 'Never'))
+                
+                # Live update active key & rotation mode
+                if hasattr(self.groq_scorer, '_api_keys') and self.groq_scorer._api_keys:
+                    k_idx = getattr(self.groq_scorer, '_current_key_idx', 0) % len(self.groq_scorer._api_keys)
+                    ak = self.groq_scorer._api_keys[k_idx]
+                    mk = f"{ak[:8]}...****" if len(ak) > 8 else "****"
+                    self.lbl_active_key.config(text=mk)
+                self.lbl_rot_mode.config(text=getattr(self.groq_scorer, 'key_mode', 'random').upper())
+                self.lbl_key_cnt.config(text=str(len(getattr(self, 'api_keys_list', []))))
+
+            self.root.after(2000, _refresh_stats)
+            
+        _refresh_stats()
+
+    def _show_scan_all_results_modal(self, scan_details):
+        """Display detailed per-profile breakdown window after Scan All completes."""
+        win = tk.Toplevel(self.root)
+        win.title("📋 Groq Scan All Resumes — Detailed Profile Report")
+        win.geometry("850x650")
+
+        t = getattr(self, "_theme", {})
+        BG     = t.get("BG", "#1e2130")
+        PANEL  = t.get("PANEL", "#252b3b")
+        BORDER = t.get("BORDER", "#3d4a6a")
+        win.configure(bg=BG)
+
+        # Header
+        hdr = tk.Frame(win, bg=BG)
+        hdr.pack(fill="x", padx=16, pady=(12, 6))
+        tk.Label(hdr, text="🤖 Groq Scan All Resumes Results", bg=BG, fg="#93c5fd", font=("Segoe UI", 14, "bold")).pack(side="left")
+
+        # Counts
+        total_p = len(scan_details)
+        added_cnt = sum(1 for d in scan_details if d["status"] == "added")
+        utd_cnt   = sum(1 for d in scan_details if d["status"] == "up_to_date")
+        err_cnt   = sum(1 for d in scan_details if d["status"] == "error")
+        total_kws = sum(len(d["unique"]) + len(d["general"]) for d in scan_details)
+
+        stats_row = tk.Frame(win, bg=BG)
+        stats_row.pack(fill="x", padx=16, pady=4)
+
+        def _card(parent, title, val, bg_c, fg_c):
+            f = tk.Frame(parent, bg=bg_c, bd=0, highlightthickness=1, highlightbackground=BORDER)
+            f.pack(side="left", padx=4, expand=True, fill="x")
+            tk.Label(f, text=title, bg=bg_c, fg=fg_c, font=("Segoe UI", 8, "bold")).pack(pady=(6, 0))
+            tk.Label(f, text=str(val), bg=bg_c, fg=fg_c, font=("Segoe UI", 15, "bold")).pack(pady=(0, 6))
+
+        _card(stats_row, "PROFILES PROCESSED", total_p,  "#1a3a5c", "#60a5fa")
+        _card(stats_row, "SUGGESTIONS FOUND", total_kws, "#1a3a2a", "#4ade80")
+        _card(stats_row, "UP TO DATE",         utd_cnt,   "#252b3b", "#9aa3c2")
+        _card(stats_row, "PROBLEMS / ERRORS",  err_cnt,   "#3a1a1a", "#f87171")
+
+        # Details Text View
+        lbl_frame = ttk.LabelFrame(win, text="Per-Profile Problem & Keyword Details")
+        lbl_frame.pack(fill="both", expand=True, padx=16, pady=8)
+
+        txt = scrolledtext.ScrolledText(lbl_frame, wrap=tk.WORD, font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        txt.pack(fill="both", expand=True, padx=6, pady=6)
+
+        txt.tag_config("title_err", foreground="#f87171", font=("Consolas", 10, "bold"))
+        txt.tag_config("title_add", foreground="#4ade80", font=("Consolas", 10, "bold"))
+        txt.tag_config("title_utd", foreground="#94a3b8", font=("Consolas", 10, "bold"))
+        txt.tag_config("detail",    foreground="#e2e8f0")
+        txt.tag_config("kw_list",   foreground="#fbbf24")
+
+        for d in scan_details:
+            name = d["name"]
+            st = d["status"]
+            reason = d["reason"]
+            
+            if st == "error":
+                txt.insert(tk.END, f"❌ {name}\n", "title_err")
+                txt.insert(tk.END, f"   Problem: {reason}\n\n", "detail")
+            elif st == "added":
+                txt.insert(tk.END, f"✅ {name}\n", "title_add")
+                txt.insert(tk.END, f"   Status: {reason}\n", "detail")
+                if d["unique"]:
+                    txt.insert(tk.END, f"   Priority Suggestions: {', '.join(d['unique'])}\n", "kw_list")
+                if d["general"]:
+                    txt.insert(tk.END, f"   General Suggestions:  {', '.join(d['general'])}\n", "kw_list")
+                txt.insert(tk.END, "\n")
+            else:
+                txt.insert(tk.END, f"ℹ️ {name}\n", "title_utd")
+                txt.insert(tk.END, f"   Status: {reason}\n\n", "detail")
+
+        txt.config(state="disabled")
+
+        btn_bar = ttk.Frame(win)
+        btn_bar.pack(fill="x", padx=16, pady=(4, 12))
+        ttk.Button(btn_bar, text="Close Report", command=win.destroy, style="Start.TButton").pack(side="right")
+
+    def setup_skill_gap_tab(self):
+        from core.keyword_suggestions import KeywordSuggestions
+        from utils.keyword_suggestions_view import KeywordSuggestionsView
+        self.keyword_suggestions = KeywordSuggestions()
+        self.keyword_suggestions_view = KeywordSuggestionsView(self.skill_gap_tab, self.keyword_suggestions)
+        self.keyword_suggestions_view.pack(fill='both', expand=True)
+
+    def _save_keyword_suggestions(self, profile, keywords, source='Résumé scan', company='', reason='Scan suggestion; verify against the résumé'):
+        self.keyword_suggestions.save(keywords, profile.get('name', '') if isinstance(profile, dict) else profile, source, company, reason)
+
+    def record_skill_gap(self, job_title, company, profile_name, extracted_kws, matched_kws, missed_kws):
+        """Keep job gaps separate from matching data, even with legacy auto-attach enabled."""
+        self._save_keyword_suggestions(profile_name, missed_kws, str(job_title), str(company),
+                                       'Job description gap; not evidence of a skill')
+
+
+
+    def _review_dice_submission(self, job_title, fields):
+        """Pause the worker; show actual visible browser values on Tk's thread."""
+        complete = threading.Event()
+        decision = {'approved': False}
+        popup = {'window': None}
+
+        def show():
+            if not getattr(self, 'running', False):
+                complete.set()
+                return
+            try:
+                window = tk.Toplevel(self.root)
+                popup['window'] = window
+                window.title('Review Dice application before Submit')
+                window.geometry('820x560')
+                window.minsize(620, 420)
+                ttk.Label(window, text=f'Review visible fields for: {job_title}',
+                          font=('Segoe UI', 13, 'bold'), wraplength=780).pack(fill='x', padx=12, pady=(12, 4))
+                ttk.Label(window, text='These values were read from the current browser form. Inspect the browser too: custom controls and hidden fields may not appear here. No application has been submitted yet.',
+                          wraplength=780).pack(fill='x', padx=12, pady=(0, 8))
+                frame = ttk.Frame(window)
+                frame.pack(fill='both', expand=True, padx=12)
+                tree = ttk.Treeview(frame, columns=('question', 'answer'), show='headings')
+                tree.heading('question', text='Field')
+                tree.heading('answer', text='Current value')
+                tree.column('question', width=330)
+                tree.column('answer', width=430)
+                tree.pack(side='left', fill='both', expand=True)
+                scroll = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
+                scroll.pack(side='right', fill='y')
+                tree.configure(yscrollcommand=scroll.set)
+                rows = {}
+                for field in fields:
+                    label = str(field.get('question') or 'Unlabelled field')
+                    value = str(field.get('answer') or 'Blank')
+                    iid = tree.insert('', 'end', values=(label, value))
+                    rows[iid] = (label, value)
+                detail = ttk.Label(window, text='Select a row to read its complete value.', wraplength=780)
+                detail.pack(fill='x', padx=12, pady=8)
+                def selection(_=None):
+                    if tree.selection():
+                        label, value = rows[tree.selection()[0]]
+                        detail.configure(text=f'{label}\n{value}')
+                tree.bind('<<TreeviewSelect>>', selection)
+                def finish(approved=False):
+                    decision['approved'] = approved
+                    complete.set()
+                    window.destroy()
+                window.protocol('WM_DELETE_WINDOW', finish)
+                window.bind('<Escape>', lambda _: finish(False))
+                actions = ttk.Frame(window)
+                actions.pack(fill='x', padx=12, pady=(0, 12))
+                ttk.Button(actions, text='Skip this application', command=finish).pack(side='left')
+                ttk.Button(actions, text='Submit this application',
+                           command=lambda: finish(True), style='Start.TButton').pack(side='right')
+                tree.focus_set()
+            except Exception:
+                complete.set()
+
+        try:
+            self.root.after(0, show)
+        except tk.TclError:
+            return False
+        while not complete.wait(0.2):
+            if not getattr(self, 'running', False):
+                try:
+                    self.root.after(0, lambda: popup['window'].destroy() if popup['window'] else None)
+                except tk.TclError:
+                    pass
+                return False
+        return decision['approved']
+
+    def _dice_checkpoint(self, job, phase):
+        from pathlib import Path
+        import hashlib
+        if phase == 'failed':
+            previous = [r for r in self._dice_recovery.unfinished('dice') if r['item_key'] == job['Job URL'] and r['run_id'] == self._dice_run]
+            if any(r['phase'] in {'external_action_started', 'needs_review'} for r in previous):
+                phase = 'needs_review'
+        files = {}
+        for profile in getattr(self, 'resume_profiles', []):
+            path = profile.get('file_path', '')
+            if path and Path(path).is_file():
+                files[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        self._dice_recovery.checkpoint('dice', job['Job URL'], self._dice_run, phase, {'record': dict(job), 'resume_files': files})
+
+
+    def _retry_answered_jobs(self):
+        from core.question_queue import QuestionQueue
+        from utils.reliability_views import choose_records
+        choose_records(self.root, 'Jobs affected by saved answers', QuestionQueue().affected_jobs(), self._start_selected_dice)
+
+    def _start_selected_dice(self, records):
+        from core.state_store import StateStore
+        if self.running:
+            messagebox.showwarning('Busy', 'Stop or finish the current Dice run first.')
+            return
+        state = StateStore()
+        jobs = []
+        try:
+            for record in records:
+                url = record.get('job_url')
+                if not url:
+                    raise ValueError('A selected job has no recorded URL')
+                with state.transaction() as db:
+                    latest = db.execute('SELECT outcome FROM application_attempts WHERE job_key=? ORDER BY created_at DESC LIMIT 1', (url,)).fetchone()
+                    uncertain = db.execute("SELECT 1 FROM work_items WHERE bot='dice' AND item_key=? AND phase IN ('external_action_started','needs_review')", (url,)).fetchone()
+                if uncertain:
+                    raise ValueError('Submission may already have occurred; review before retrying')
+                if latest and latest['outcome'] in {'applied', 'already_applied', 'unconfirmed'}:
+                    raise ValueError('A selected job has a completed or uncertain outcome; review it instead')
+                job = {'Job URL': url, 'Job Title': record.get('job_title', ''), 'Company': ''}
+                jobs.append(job)
+            self._selected_retry_jobs = jobs
+            self.start_applying()
+            if not self.running:
+                self._selected_retry_jobs = None
+        except Exception as exc:
+            messagebox.showerror('Retry blocked', str(exc))
+        finally:
+            state.close()
+
+    def _record_skipped_job(self, job):
+        """One skipped count per job per run; reason details remain in logs/Excel."""
+        if not hasattr(self, '_skipped_job_keys'):
+            self._skipped_job_keys = set()
+        url = str(job.get('Job URL') or job.get('url') or '').strip().lower().rstrip('/')
+        key = ('url', url) if url else ('record', str(job.get('Job Title') or ''),
+                                       str(job.get('Company') or ''), str(job.get('Location') or ''))
+        if key in self._skipped_job_keys:
+            return
+        self._skipped_job_keys.add(key)
+        count = len(self._skipped_job_keys)
+        self.root.after(0, lambda c=count: self.jobs_skipped_label.config(text=str(c)))
 
     def update_status(self, message):
         """Update status message and log it"""
         self.logger.info(message)
         self.root.after(0, lambda msg=message: self.status_label.config(text=msg))
+
+    def on_closing(self):
+        if self.running and not messagebox.askyesno('Confirm Exit', 'Stop after the current operation and close?'):
+            return
+        self.running = False
+        self.is_paused = False
+        self.update_status('Stopping; waiting for current operation to finish…')
+        def finish():
+            if getattr(self, 'job_thread', None) and self.job_thread.is_alive():
+                self.root.after(250, finish)
+                return
+            allow_sleep()
+            self.root.destroy()
+        finish()
         
 
 class LogTextHandler(logging.Handler):
@@ -2087,25 +4717,36 @@ class LogTextHandler(logging.Handler):
     def __init__(self, text_widget):
         logging.Handler.__init__(self)
         self.text_widget = text_widget
+        self._log_host = text_widget.winfo_toplevel()
         
     def emit(self, record):
         msg = self.format(record)
         
         def append_log():
+            from utils.log_view import trim_log_widget
             self.text_widget.config(state="normal")
             self.text_widget.insert("end", msg + "\n")
+            trim_log_widget(self.text_widget)
             self.text_widget.see("end")  # Scroll to the bottom
             self.text_widget.config(state="disabled")
             
         # Schedule the update in the main thread
-        self.text_widget.after(0, append_log)
+        host = self.text_widget.winfo_toplevel() if threading.current_thread() is threading.main_thread() else getattr(self, '_log_host', None)
+        if host is not None:
+            self._log_host = host
+            host.after(0, append_log)
 
 
 def main():
-    root = tk.Tk()
-    app = DiceAutoBotApp(root)
-    root.protocol("WM_DELETE_WINDOW", root.quit)
-    root.mainloop()
+    from utils.process_lock import instance_lock
+    try:
+        with instance_lock('dice', os.path.join(os.path.dirname(__file__), 'data')):
+            root = tk.Tk()
+            app = DiceAutoBotApp(root)
+            root.protocol("WM_DELETE_WINDOW", app.on_closing)
+            root.mainloop()
+    except TimeoutError:
+        messagebox.showerror('Dice already running', 'Close the existing Dice window before launching another copy.')
 
 if __name__ == "__main__":
     main()

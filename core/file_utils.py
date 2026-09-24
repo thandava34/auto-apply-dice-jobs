@@ -42,17 +42,29 @@ def extract_text_from_file(file_path):
         
         elif ext == ".docx":
             doc = Document(file_path)
-            return "\n".join([para.text for para in doc.paragraphs])
+            # Iterate XML text nodes so tables and drawing/text-box content are
+            # included; python-docx's ``paragraphs`` collection omits both.
+            chunks = [
+                node.text.strip()
+                for node in doc.element.body.iter()
+                if node.tag.endswith("}t") and node.text and node.text.strip()
+            ]
+            for section in doc.sections:
+                for part in (section.header, section.footer):
+                    chunks.extend(
+                        node.text.strip()
+                        for node in part._element.iter()
+                        if node.tag.endswith("}t") and node.text and node.text.strip()
+                    )
+            return "\n".join(chunks)
             
         elif ext == ".doc":
-            # For .doc, we usually need external tools on Windows, or simplified text extraction.
-            # PyMuPDF can sometimes handle .doc via mutation, but Document(docx) won't work.
-            # We'll suggest the user convert to .docx for best results, but try a basic read.
-            try:
-                # If we have antiword or similar, we could use it, but for now, we'll return a warning.
-                return "Warning: .doc files are older and less reliable for extraction. Please convert to .docx if this fails."
-            except:
-                return ""
+            # Pure .doc extraction requires external tools (e.g. antiword) on Windows.
+            # We can't safely parse it here, so return empty and let the caller
+            # handle the missing text (rather than sending this warning as resume content).
+            print(f"Warning: .doc format is not supported for extraction. "
+                  f"Please convert '{file_path}' to .docx for best results.")
+            return ""
         
         else:
             # Try to read as plain text

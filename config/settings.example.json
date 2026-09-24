@@ -1,0 +1,53 @@
+{
+  "search_queries": [
+    "Data Engineer",
+    "Machine Learning Engineer"
+  ],
+  "exclude_keywords": [
+    "W2 only",
+    "No C2C"
+  ],
+  "include_keywords": [
+    "Python",
+    "SQL",
+    "ETL"
+  ],
+  "resume_profiles": [
+    {
+      "id": "data-engineer",
+      "name": "Data Engineer",
+      "file_path": "resumes/data-engineer.pdf",
+      "keywords": [
+        "Python",
+        "SQL",
+        "Airflow"
+      ],
+      "unique_keywords": [
+        "Databricks"
+      ],
+      "must_have": [
+        "Python"
+      ]
+    }
+  ],
+  "headless_mode": false,
+  "keep_screen_awake": true,
+  "batch_excel_saves": true,
+  "job_application_limit": 25,
+  "profile_name_boost_mode": "high",
+  "semantic_enabled": true,
+  "minimum_ats_fit": 25,
+  "filter_employment_type": "ALL",
+  "filter_posted_date": "THREE",
+  "filter_work_setting": "ALL",
+  "filter_easy_apply": true,
+  "filter_location": "",
+  "filter_radius": "30",
+  "filter_will_sponsor": false,
+  "filter_salary_min": "",
+  "auto_answer_questions": false,
+  "allow_ai_generated_application_answers": false,
+  "application_answers": {},
+  "auto_attach_missed_kws": false,
+  "api_keys_list": []
+}

@@ -1,45 +1,80 @@
-# Python
+# Python and tooling
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyd
 *.so
 .Python
+.venv/
 venv/
 ENV/
-.env
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Excel and data files
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+config/settings.json
+config/outreach_settings.json
+config/gmail_client_secret.json
+config/gmail_token.json
+config/*client_secret*.json
+config/*token*.json
+config/*token*.json.*
+config/*token*.bak
+!config/*.example.json
+
+# Browser profiles contain cookies, sessions, history, and account data
+chrome_profile*/
+selenium_profile*/
+
+# Runtime databases, exports, queues, and learning data
+data/*
+!data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 *.xlsx
 *.xls
 job_data.json
 job_application_summary.json
-*.txt
 
-# Personal settings — contains private resume paths and profile data
-config/settings.json
+# Logs, crash data, screenshots, and captured web pages
+# Local snapshots and exploratory scripts may contain personal application data.
+/backups/
+/scratch/
+/.claude/
+logs/*
+!logs/.gitkeep
+*.log
+/login_attempt.html
+/login_attempt.png
+/nvoids_*.html
+/nvoids_*.png
+/rendered_search.html
+/search_*.html
+/search_*.png
+/null
 
-# Logs
-logs/*.log
-
-# macOS system files
-.DS_Store
-.AppleDouble
-.LSOverride
-
-# Windows system files
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-code_reader.py
-
-# AI model cache (large downloaded files, ~80MB — users download on first run)
+# Downloaded model cache
 models/*
 !models/.gitkeep
 
-# Local AI learning database (contains private application history)
-data/*
-!data/.gitkeep
-
-# Logs (auto-generated, excluded from repo)
-logs/*
-!logs/.gitkeep
+# OS and editor files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.lock
+*.pre-v1.bak
+*.question-memory-v1.bak
+**/message_snapshots/
